@@ -39,7 +39,7 @@ jobs:
           bandit -ll -r bot.py -f json -o bandit-report.json || true
           bandit -ll -r bot.py -f sarif -o bandit-report.sarif || true
           bandit -ll -r bot.py -f screen
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@v4
         if: always() && hashFiles('bandit-report.sarif') != ''
         with:
           sarif_file: bandit-report.sarif
@@ -50,11 +50,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: github/codeql-action/init@v3
+      - uses: github/codeql-action/init@v4
         with:
           languages: python
           queries: security-and-quality
-      - uses: github/codeql-action/analyze@v3
+      - uses: github/codeql-action/analyze@v4
         with:
           category: "/language:python"
 
