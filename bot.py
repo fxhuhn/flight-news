@@ -1,32 +1,33 @@
 import base64
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 import html
 import logging
 import os
-from pathlib import Path
 import random
 import re
 import signal
 import sqlite3
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta
+from pathlib import Path
+
 try:
     import tomllib
 except ModuleNotFoundError:
     import tomli as tomllib
-from typing import Any, Literal, Type
 import urllib.parse
+from typing import Any, Literal, Type
 
-from fast_flights import FlightQuery, Passengers, create_query
-from fast_flights.pb import flights_pb2
 import feedparser
-from google import genai
-from google.genai import errors, types
-from pydantic import BaseModel, Field
 import requests
 import requests.adapters
 import trafilatura
+from fast_flights import FlightQuery, Passengers, create_query
+from fast_flights.pb import flights_pb2
+from google import genai
+from google.genai import errors
+from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -43,12 +44,14 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", 1800))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1800"))
 DB_PATH = os.environ.get("DB_PATH")
 if not DB_PATH:
-    DB_PATH = "/app/data/deals.db" if os.path.exists("/app") else str(Path(__file__).resolve().parent / "data" / "deals.db")
+    DB_PATH = (
+        "/app/data/deals.db" if os.path.exists("/app") else str(Path(__file__).resolve().parent / "data" / "deals.db")
+    )
 
-HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/tmp/heartbeat")
+HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/tmp/heartbeat")  # nosec B108
 
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", Path(__file__).resolve().parent / "config.toml"))
 
@@ -106,13 +109,14 @@ def load_config() -> dict[str, Any]:
             logging.warning(f"Konnte config.toml nicht laden ({e}), nutze Standardwerte.")
     return defaults
 
+
 CONFIG = load_config()
 HOME_AIRPORT: str = str(CONFIG["origin"].get("home_airport", "HAM")).strip().upper()
-PREFERRED_HUBS: set[str] = {str(h).strip().upper() for h in CONFIG["origin"].get("preferred_hubs", ["HAM", "FRA", "BER", "CPH"])}
+PREFERRED_HUBS: set[str] = {
+    str(h).strip().upper() for h in CONFIG["origin"].get("preferred_hubs", ["HAM", "FRA", "BER", "CPH"])
+}
 IGNORED_AIRLINES: list[str] = [
-    str(a).strip()
-    for a in CONFIG.get("airlines", {}).get("ignored_airlines", [])
-    if str(a).strip()
+    str(a).strip() for a in CONFIG.get("airlines", {}).get("ignored_airlines", []) if str(a).strip()
 ]
 MAX_ENTRIES_PER_FEED: int = int(
     os.environ.get("MAX_ENTRIES_PER_FEED", CONFIG.get("system", {}).get("max_entries_per_feed", 25))
@@ -120,18 +124,14 @@ MAX_ENTRIES_PER_FEED: int = int(
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    "Accept": "application/rss+xml, application/xml, text/xml, */*"
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
 
 
 def create_http_session() -> requests.Session:
     """Erstellt eine wiederverwendbare requests.Session mit TCP Connection Pooling und Keep-Alive."""
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(
-        pool_connections=15,
-        pool_maxsize=30,
-        max_retries=1
-    )
+    adapter = requests.adapters.HTTPAdapter(pool_connections=15, pool_maxsize=30, max_retries=1)
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update(HEADERS)
@@ -142,23 +142,21 @@ SESSION = create_http_session()
 
 RSS_FEEDS = [
     # 1. Foren (Vielfliegertreff Primärquellen - Forum 53 = First & Biz Tarife, Forum 5 = Mileage Runs)
-    "https://www.vielfliegertreff.de/forum/forums/53/index.rss",                                 # VFT: First & Business Class Tarife
-    "https://www.vielfliegertreff.de/forum/forums/5/index.rss",                                  # VFT: Mileage Runs & Status-Booster
-
+    "https://www.vielfliegertreff.de/forum/forums/53/index.rss",  # VFT: First & Business Class Tarife
+    "https://www.vielfliegertreff.de/forum/forums/5/index.rss",  # VFT: Mileage Runs & Status-Booster
     # 2. Spezialisierte Business-Class & Status-Portale
-    "https://premium-flights.com/feed/",                                                          # Premium-Flights: Biz/First & Status-Runs
-    "https://travel-dealz.de/kategorie/fluege/business-class/feed/",                              # Travel-Dealz: Business Class
-    "https://travel-dealz.com/category/flights/business-class/feed/",                             # Travel-Dealz COM: Ex-EU Deals
-    "https://travel-dealz.de/kategorie/fluege/first-class/feed/",                                 # Travel-Dealz: First Class
-    "https://youhavebeenupgraded.boardingarea.com/feed/",                                         # You Have Been Upgraded: GDS/Matrix- & Biz-Deals
-
+    "https://premium-flights.com/feed/",  # Premium-Flights: Biz/First & Status-Runs
+    "https://travel-dealz.de/kategorie/fluege/business-class/feed/",  # Travel-Dealz: Business Class
+    "https://travel-dealz.com/category/flights/business-class/feed/",  # Travel-Dealz COM: Ex-EU Deals
+    "https://travel-dealz.de/kategorie/fluege/first-class/feed/",  # Travel-Dealz: First Class
+    "https://youhavebeenupgraded.boardingarea.com/feed/",  # You Have Been Upgraded: GDS/Matrix- & Biz-Deals
     # 3. DACH-Meilenblogs, internationale Deal-Portale & Error-Fare-Tracker
-    "https://reisetopia.de/feed/",                                                                # Reisetopia: Flug- & Hotel-Angebote
-    "https://frankfurtflyer.de/?feed=rss2",                                                       # Frankfurtflyer: Deals & Star Alliance Sales (FRA)
-    "https://www.fly4free.com/flights/flight-deals/europe/feed/",                                 # Fly4Free: Europa-weite Deals & Error Fares
-    "https://meilenoptimieren.com/feed/",                                                         # meilenoptimieren: Deals & Punkte-Analysen
-    "https://www.secretflying.com/category/flight-deals/europe-deals/feed/",                      # Secret Flying: Europe Deals & Error Fares
-    "https://www.flynous.com/feed/",                                                              # Flynous: Günstige Langstreckenflüge (inkl. Biz) ab Europa
+    "https://reisetopia.de/feed/",  # Reisetopia: Flug- & Hotel-Angebote
+    "https://frankfurtflyer.de/?feed=rss2",  # Frankfurtflyer: Deals & Star Alliance Sales (FRA)
+    "https://www.fly4free.com/flights/flight-deals/europe/feed/",  # Fly4Free: Europa-weite Deals & Error Fares
+    "https://meilenoptimieren.com/feed/",  # meilenoptimieren: Deals & Punkte-Analysen
+    "https://www.secretflying.com/category/flight-deals/europe-deals/feed/",  # Secret Flying: Europe Deals & Error Fares
+    "https://www.flynous.com/feed/",  # Flynous: Günstige Langstreckenflüge (inkl. Biz) ab Europa
 ]
 
 # Dedizierte Premium-Feeds (enthalten praktisch ausschließlich Business- / First-Class Angebote)
@@ -173,25 +171,61 @@ DEDICATED_PREMIUM_FEEDS = {
 
 # Signalwörter für Business / First Class (Pflicht für gemischte Feeds wie Fly4free, Reisetopia, etc.)
 POSITIVE_CLASS_KEYWORDS = [
-    "business class", "business-class", "businessclass", "biz class", "bizclass", "biz-class",
-    "first class", "first-class", "firstclass",
-    "qsuite", "polaris", "club suites", "club world", "upper class",
-    "lie-flat", "lie flat", "flatbed", "flat-bed", "mint suite"
+    "business class",
+    "business-class",
+    "businessclass",
+    "biz class",
+    "bizclass",
+    "biz-class",
+    "first class",
+    "first-class",
+    "firstclass",
+    "qsuite",
+    "polaris",
+    "club suites",
+    "club world",
+    "upper class",
+    "lie-flat",
+    "lie flat",
+    "flatbed",
+    "flat-bed",
+    "mint suite",
 ]
 
 # Harte Negativ-Keywords: Führen IMMER zum Ausschluss (Fragen, Meilenkauf, Hotels, etc.)
 HARD_NEGATIVE_KEYWORDS = [
-    "frage:", "question:", "hilfe", "help", "sammelthread", "diskussion",
-    "[fare gone]", "[expired]", "abgelaufen",
-    "hotel", "kreditkarte", "girokonto", "points kaufen", "punkte kaufen", "meilen kaufen"
+    "frage:",
+    "question:",
+    "hilfe",
+    "help",
+    "sammelthread",
+    "diskussion",
+    "[fare gone]",
+    "[expired]",
+    "abgelaufen",
+    "hotel",
+    "kreditkarte",
+    "girokonto",
+    "points kaufen",
+    "punkte kaufen",
+    "meilen kaufen",
 ]
 
 # Schwache Negativ-Keywords: Schließen Billig-/Economy-Flüge aus,
 # dürfen aber KEINE echten Deals blockieren, wenn im Titel explizit Business/First Class steht.
 WEAK_NEGATIVE_KEYWORDS = [
-    "economy", "eco class", "y class", "wizz", "ryanair", "easyjet", "condor economy",
-    "full-service", "full service",
-    "sitzplatz", "gepäck", "upgrade voucher"
+    "economy",
+    "eco class",
+    "y class",
+    "wizz",
+    "ryanair",
+    "easyjet",
+    "condor economy",
+    "full-service",
+    "full service",
+    "sitzplatz",
+    "gepäck",
+    "upgrade voucher",
 ]
 
 # Abwärtskompatibilität für Imports aus test_suite.py und run_batch_push.py
@@ -244,10 +278,7 @@ def is_feed_entry_eligible_pre_filter(entry_title: str, entry_content: str, feed
 
 class FlightDealEvaluation(BaseModel):
     detected_cabin_class: Literal[
-        "Business Class",
-        "First Class",
-        "Economy / Premium Eco",
-        "Unklar / Nicht genannt"
+        "Business Class", "First Class", "Economy / Premium Eco", "Unklar / Nicht genannt"
     ] = Field(
         description=(
             "Die im Text EINDEUTIG und EXPLIZIT genannte Reiseklasse. "
@@ -274,7 +305,7 @@ class FlightDealEvaluation(BaseModel):
         "FTL-Booster (Points + QP)",
         "Star Alliance (Nur Points)",
         "Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
-        "Irrelevant"
+        "Irrelevant",
     ] = Field(
         description=(
             "Kategorie des Deals: 'FTL-Booster (Points + QP)' für alle vollintegrierten Miles & More Partner "
@@ -297,12 +328,18 @@ class FlightDealEvaluation(BaseModel):
     )
     iata_destination: str = Field(description="3-Letter IATA Code des Hauptziels (z.B. BKK, SIN, GRU)")
     is_open_jaw: bool = Field(description="True, falls Gabelflug (Rückflug endet an anderem Flughafen als iata_origin)")
-    iata_return_end: str = Field(description="3-Letter IATA Code des Rückflug-Endpunkts (identisch mit iata_origin bei normalem Return)")
+    iata_return_end: str = Field(
+        description="3-Letter IATA Code des Rückflug-Endpunkts (identisch mit iata_origin bei normalem Return)"
+    )
     region: Literal["Asien", "Südamerika", "Mittelamerika", "Nahost", "Sonstige"]
-    sample_outbound_date: str = Field(description="Hinflugdatum im Format YYYY-MM-DD aus dem Artikel/Buchungslink oder plausibles Datum im Reisezeitraum")
+    sample_outbound_date: str = Field(
+        description="Hinflugdatum im Format YYYY-MM-DD aus dem Artikel/Buchungslink oder plausibles Datum im Reisezeitraum"
+    )
     sample_return_date: str = Field(description="Rückflugdatum im Format YYYY-MM-DD (ca. 10-14 Tage nach Hinflug)")
     price_eur: int = Field(description="Gesamtpreis umgerechnet in Euro (ganzzahlig)")
-    booking_class: str = Field(description="Buchungsklasse falls im Text erwähnt (z.B. 'P', 'Z', 'J'), sonst 'Nicht genannt'")
+    booking_class: str = Field(
+        description="Buchungsklasse falls im Text erwähnt (z.B. 'P', 'Z', 'J'), sonst 'Nicht genannt'"
+    )
     mm_points: int = Field(description="Berechnete Miles & More Points für den gesamten Return-Flug")
     mm_qualifying_points: int = Field(
         description=(
@@ -338,7 +375,7 @@ class FlightDealEvaluation(BaseModel):
 
 def is_airline_ignored_in_text(text: str, ignored_airlines: list[str] | None = None) -> tuple[bool, str]:
     """Prüft, ob ein Text (z.B. RSS-Titel oder Feed-Inhalt) eine ignorierte Airline enthält.
-    
+
     Unterscheidet zwischen längeren Namen/Akronymen (z.B. 'Azerbaijan Airlines', 'AZAL',
     'Turkmenistan Airlines') und kurzen 2-Letter IATA-Codes (z.B. 'T5', 'J2'), um
     Fehlalarme (z.B. mit London Heathrow Terminal 5 'LHR T5') zuverlässig auszuschließen.
@@ -356,7 +393,7 @@ def is_airline_ignored_in_text(text: str, ignored_airlines: list[str] | None = N
             if target.upper() == "T5" and re.search(
                 r"\b(?:terminal\s*5|lhr\s*t5|heathrow\s*t5|t5\s*(?:transfer|umstieg|galleries|concourse|lounge))\b",
                 text,
-                re.IGNORECASE
+                re.IGNORECASE,
             ):
                 continue
 
@@ -428,11 +465,7 @@ def normalize_and_verify_deal_mm_points(deal: FlightDealEvaluation) -> FlightDea
         deal.primary_airline_iata = "LO"
 
     names_lower = (deal.airline_names or "").lower()
-    is_lot = (
-        primary == "LO"
-        or "lot polish" in names_lower
-        or bool(re.search(r"\blot\b", names_lower))
-    )
+    is_lot = primary == "LO" or "lot polish" in names_lower or bool(re.search(r"\blot\b", names_lower))
 
     if is_lot and primary != "LO":
         deal.primary_airline_iata = "LO"
@@ -474,7 +507,10 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
     if deal.region in ("Asien", "Südamerika", "Mittelamerika") and deal.price_eur < 750:
         combined_lower = f"{title} {full_text}".lower()
         if not any(ef in combined_lower for ef in ("error fare", "error-fare", "preisfehler", "errorfare")):
-            return False, f"Unplausibler Langstreckenpreis für Business Class: {deal.price_eur} € (Verdacht auf Economy)"
+            return (
+                False,
+                f"Unplausibler Langstreckenpreis für Business Class: {deal.price_eur} € (Verdacht auf Economy)",
+            )
 
     # 3. Origin-Verifikation (Origin-Hijacking verhindern)
     origin = (deal.iata_origin or "").upper().strip()
@@ -517,15 +553,17 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
 
 def validate_startup():
     missing = [
-        name for name, val in [
+        name
+        for name, val in [
             ("GEMINI_API_KEY", GEMINI_API_KEY),
             ("TELEGRAM_BOT_TOKEN", TELEGRAM_BOT_TOKEN),
-            ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID)
-        ] if not val
+            ("TELEGRAM_CHAT_ID", TELEGRAM_CHAT_ID),
+        ]
+        if not val
     ]
     if missing:
         raise SystemExit(f"KRITISCHER FEHLER: Fehlende Umgebungsvariablen: {', '.join(missing)}")
-    
+
     # Prüfe Telegram Bot Token beim Start mit Retry
     tg_verified = False
     for attempt in range(1, 4):
@@ -540,11 +578,13 @@ def validate_startup():
         except requests.RequestException as e:
             logging.warning(f"Telegram-Check Versuch {attempt}/3 fehlgeschlagen: {e}")
         time.sleep(2)
-    
+
     if tg_verified:
         logging.info("Startup-Check erfolgreich: API-Keys und Telegram-Verbindung verifiziert.")
     else:
-        logging.warning("Telegram-Verbindung konnte beim Start nicht geprüft werden. Bot läuft weiter und versucht es im Zyklus erneut.")
+        logging.warning(
+            "Telegram-Verbindung konnte beim Start nicht geprüft werden. Bot läuft weiter und versucht es im Zyklus erneut."
+        )
 
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
@@ -552,9 +592,13 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
     c = conn.cursor()
-    c.execute("CREATE TABLE IF NOT EXISTS seen_urls (url_clean TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    c.execute("CREATE TABLE IF NOT EXISTS sent_deals (deal_fingerprint TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-    
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS seen_urls (url_clean TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS sent_deals (deal_fingerprint TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+    )
+
     # Automatische sanfte Schema-Migration für bestehende Datenbanken
     c.execute("PRAGMA table_info(sent_deals)")
     existing_cols = {col[1] for col in c.fetchall()}
@@ -583,11 +627,11 @@ def build_deal_fingerprint(deal: FlightDealEvaluation) -> str:
     """
     airline_code = (deal.primary_airline_iata or "").strip().upper()
     if not airline_code and deal.airline_names:
-        m = re.search(r'\b([A-Z0-9]{2})\b', deal.airline_names)
+        m = re.search(r"\b([A-Z0-9]{2})\b", deal.airline_names)
         if m:
             airline_code = m.group(1).upper()
         else:
-            airline_code = re.sub(r'[^A-Z0-9]', '', deal.airline_names.upper())[:6] or "XX"
+            airline_code = re.sub(r"[^A-Z0-9]", "", deal.airline_names.upper())[:6] or "XX"
     if not airline_code:
         airline_code = "XX"
 
@@ -599,7 +643,9 @@ def build_deal_fingerprint(deal: FlightDealEvaluation) -> str:
     return f"{orig}-{dest}-{airline_code}"
 
 
-def should_send_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation, min_price_drop: int = 75) -> tuple[bool, str, int]:
+def should_send_deal(
+    conn: sqlite3.Connection, deal: FlightDealEvaluation, min_price_drop: int = 75
+) -> tuple[bool, str, int]:
     """
     Intelligente Prüfung auf Duplikate & Preisänderungen:
     - Gibt (True, "new_deal", 0) zurück, wenn Route+Airline noch nie gesendet wurden.
@@ -641,14 +687,17 @@ def record_sent_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation):
     fp = build_deal_fingerprint(deal)
     airline_code = (deal.primary_airline_iata or "").strip().upper()
     c = conn.cursor()
-    c.execute("""
+    c.execute(
+        """
         INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, updated_at)
         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
         ON CONFLICT(deal_fingerprint) DO UPDATE SET
             price_eur = excluded.price_eur,
             airline_code = excluded.airline_code,
             updated_at = CURRENT_TIMESTAMP
-    """, (fp, deal.price_eur, airline_code))
+    """,
+        (fp, deal.price_eur, airline_code),
+    )
     conn.commit()
 
 
@@ -673,30 +722,30 @@ def clean_html(raw_html: str) -> str:
 def extract_deal_context(raw_html: str) -> tuple[str, str]:
     unquoted = urllib.parse.unquote(raw_html)
     dates_info = []
-    
+
     # 1. Datumsparameter in Buchungs-URLs (z.B. date_out=2027-02-13&date_in=2027-02-23)
-    d_out = re.findall(r'(?:date_out|outbound|departure|depDate|out)=([0-9]{4}-[0-9]{2}-[0-9]{2})', unquoted, re.I)
-    d_in = re.findall(r'(?:date_in|inbound|return|retDate|in)=([0-9]{4}-[0-9]{2}-[0-9]{2})', unquoted, re.I)
+    d_out = re.findall(r"(?:date_out|outbound|departure|depDate|out)=([0-9]{4}-[0-9]{2}-[0-9]{2})", unquoted, re.I)
+    d_in = re.findall(r"(?:date_in|inbound|return|retDate|in)=([0-9]{4}-[0-9]{2}-[0-9]{2})", unquoted, re.I)
     for o, i in zip(d_out, d_in):
         dates_info.append(f"Gefundener Buchungstermin im Link: Hinflug {o}, Rückflug {i}")
-    
+
     # 2. Airline-Parameter in Buchungs-URLs
-    airline_in_link = re.findall(r'airline=([A-Z0-9]{2})', unquoted, re.I)
+    airline_in_link = re.findall(r"airline=([A-Z0-9]{2})", unquoted, re.I)
     if airline_in_link:
         dates_info.append(f"Gefundene Airline im Link: {airline_in_link[0].upper()}")
-        
+
     booking_links = re.findall(
-        r'href=[\"\'](https?://(?:go2\.travel-dealz\.de|www\.google\.com/travel/flights|google\.com/travel/flights|google\.com/flights|www\.skyscanner|www\.momondo|kayak\.|fave\.co/|awin1\.com|prf\.hn|expedia\.|trip\.com)[^\"\']+)[\"\']',
+        r"href=[\"\'](https?://(?:go2\.travel-dealz\.de|www\.google\.com/travel/flights|google\.com/travel/flights|google\.com/flights|www\.skyscanner|www\.momondo|kayak\.|fave\.co/|awin1\.com|prf\.hn|expedia\.|trip\.com)[^\"\']+)[\"\']",
         unquoted,
-        re.I
+        re.I,
     )
-    
+
     cleaned = clean_html(raw_html)
     extra_context = "\n".join(dates_info)
     sample_booking = html.unescape(booking_links[0]) if booking_links else ""
     if sample_booking:
         extra_context += f"\nBeispiel-Buchungslink: {sample_booking}"
-        
+
     full_text = f"{extra_context}\n\n{cleaned}" if extra_context else cleaned
     return full_text, sample_booking
 
@@ -754,11 +803,11 @@ def build_gf_main_url(deal: FlightDealEvaluation) -> str:
     try:
         info = flights_pb2.Info()
         return_dest = deal.iata_return_end if (deal.is_open_jaw and deal.iata_return_end) else deal.iata_origin
-        is_multi = (deal.is_open_jaw and return_dest != deal.iata_origin)
+        is_multi = deal.is_open_jaw and return_dest != deal.iata_origin
 
         airline_code = deal.primary_airline_iata.strip().upper() if deal.primary_airline_iata else ""
         if not airline_code and deal.airline_names:
-            m = re.search(r'\b([A-Z0-9]{2})\b', deal.airline_names)
+            m = re.search(r"\b([A-Z0-9]{2})\b", deal.airline_names)
             if m:
                 airline_code = m.group(1).upper()
 
@@ -797,7 +846,7 @@ def build_positioning_url(origin: str, out_date: str, ret_date: str, home: str |
     try:
         pos_out = (datetime.strptime(out_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         pos_ret = (datetime.strptime(ret_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-        
+
         q = create_query(
             flights=[
                 FlightQuery(date=pos_out, from_airport=home_hub, to_airport=origin),
@@ -807,7 +856,7 @@ def build_positioning_url(origin: str, out_date: str, ret_date: str, home: str |
             trip="round-trip",
             passengers=Passengers(adults=1),
             currency="EUR",
-            language="de"
+            language="de",
         )
         return q.url()
     except Exception as e:
@@ -886,9 +935,9 @@ def generate_with_gemini_fallback(
                     exc_str = str(inner_exc)
 
             # Fall B: Modell existiert nicht / veraltet (404 Not Found) -> sofort nächstes Modell
-            is_not_found = (
-                isinstance(exc, errors.APIError) and exc.code == 404
-            ) or ("404" in exc_str or "NOT_FOUND" in exc_str)
+            is_not_found = (isinstance(exc, errors.APIError) and exc.code == 404) or (
+                "404" in exc_str or "NOT_FOUND" in exc_str
+            )
 
             if is_not_found:
                 logging.warning(
@@ -901,10 +950,7 @@ def generate_with_gemini_fallback(
                 continue
 
             # Fall C: Transiente Fehler (429 Quota, 503 Overload, Timeout) -> Wait & Shift
-            is_transient = (
-                isinstance(exc, errors.APIError)
-                and exc.code in (408, 429, 500, 502, 503, 504)
-            ) or any(
+            is_transient = (isinstance(exc, errors.APIError) and exc.code in (408, 429, 500, 502, 503, 504)) or any(
                 code in exc_str
                 for code in (
                     "503",
@@ -921,12 +967,8 @@ def generate_with_gemini_fallback(
                 transient_attempt += 1
 
                 # Wartezeit ermitteln
-                retry_match = re.search(
-                    r"retry.*?(\d+(?:\.\d+)?)\s*s", exc_str, re.IGNORECASE
-                )
-                retry_h_match = re.search(
-                    r"retry.*?(\d+)\s*h", exc_str, re.IGNORECASE
-                )
+                retry_match = re.search(r"retry.*?(\d+(?:\.\d+)?)\s*s", exc_str, re.IGNORECASE)
+                retry_h_match = re.search(r"retry.*?(\d+)\s*h", exc_str, re.IGNORECASE)
                 if retry_h_match or (retry_match and float(retry_match.group(1)) > 65):
                     # Tägliches Limit für dieses Modell erschöpft (>65s) -> sofort Modell aus der Liste werfen
                     logging.warning(
@@ -942,9 +984,7 @@ def generate_with_gemini_fallback(
                 elif "429" in exc_str:
                     sleep_time = min(35 * transient_attempt, 60)
                 else:
-                    base_delay = transient_delays[
-                        min(transient_attempt - 1, len(transient_delays) - 1)
-                    ]
+                    base_delay = transient_delays[min(transient_attempt - 1, len(transient_delays) - 1)]
                     sleep_time = int(base_delay + random.uniform(1.0, 4.0))
 
                 # Bei Überlastung nächstes Modell anwählen
@@ -982,7 +1022,7 @@ def evaluate_with_gemini(client: genai.Client, title: str, clean_text: str) -> F
     ignored_airlines_str = ", ".join(ignored_airlines) if ignored_airlines else "Keine"
 
     prompt = f"""
-Analysiere diesen Flug-Deal für einen Reisenden mit Basis {HOME_AIRPORT} (Bevorzugte Hubs: {hubs_str}). Aktuelles Datum: {datetime.now().strftime('%Y-%m-%d')}.
+Analysiere diesen Flug-Deal für einen Reisenden mit Basis {HOME_AIRPORT} (Bevorzugte Hubs: {hubs_str}). Aktuelles Datum: {datetime.now().strftime("%Y-%m-%d")}.
 
 STRIKTE REGELN FÜR 'is_relevant = True':
 1. REISEKLASSE & BEWEISPFLICHT (NULL-TOLERANZ):
@@ -1042,7 +1082,7 @@ Inhalt: {clean_text[:5000]}
     )
     if response.parsed is None:
         raise ValueError("Gemini lieferte eine leere strukturierte Antwort (response.parsed ist None).")
-    
+
     deal = response.parsed
     deal = normalize_and_verify_deal_mm_points(deal)
     is_ignored, ignored_air = is_deal_ignored_airline(deal, ignored_airlines)
@@ -1055,13 +1095,17 @@ Inhalt: {clean_text[:5000]}
     return deal
 
 
-def build_telegram_message(deal: FlightDealEvaluation, title: str, url: str, sample_booking: str = "", prev_price: int = 0) -> str:
+def build_telegram_message(
+    deal: FlightDealEvaluation, title: str, url: str, sample_booking: str = "", prev_price: int = 0
+) -> str:
     gf_main = build_gf_main_url(deal)
     pos_line = ""
     if deal.iata_origin not in PREFERRED_HUBS:
-        gf_pos = build_positioning_url(deal.iata_origin, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT)
+        gf_pos = build_positioning_url(
+            deal.iata_origin, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
+        )
         pos_line = f'\n🔹 <a href="{gf_pos}">Positionierung: {html.escape(HOME_AIRPORT)}–{html.escape(deal.iata_origin)} (+/- 24h Stopover)</a>'
-    
+
     booking_line = ""
     if sample_booking and sample_booking.startswith("http"):
         booking_line = f'\n🔹 <a href="{html.escape(sample_booking, quote=True)}">Geprüftes Buchungsbeispiel (Skyscanner / OTA)</a>'
@@ -1069,7 +1113,7 @@ def build_telegram_message(deal: FlightDealEvaluation, title: str, url: str, sam
     route_str = f"<code>{html.escape(deal.iata_origin)}</code> ➔ <code>{html.escape(deal.iata_destination)}</code>"
     if deal.is_open_jaw and deal.iata_return_end != deal.iata_origin:
         route_str += f" ➔ <code>{html.escape(deal.iata_return_end)}</code> (Gabelflug)"
-    
+
     ftl_info = ""
     if deal.mm_points > 0:
         pct_p = round((deal.mm_points / 650) * 100)
@@ -1082,9 +1126,20 @@ def build_telegram_message(deal: FlightDealEvaluation, title: str, url: str, sam
     advice_line = ""
     raw_advice = (deal.routing_advice or "").strip()
     forbidden_advice_keywords = [
-        "point", "qp", "miles & more", "allianz", "star alliance",
-        "preis-check", "ota-bestpreis", "phantom-verfügbarkeit", "phantomverfügbarkeit",
-        "zahlungsaufschläge", "airline-direktbuchung", "momondo", "kayak", "skyscanner"
+        "point",
+        "qp",
+        "miles & more",
+        "allianz",
+        "star alliance",
+        "preis-check",
+        "ota-bestpreis",
+        "phantom-verfügbarkeit",
+        "phantomverfügbarkeit",
+        "zahlungsaufschläge",
+        "airline-direktbuchung",
+        "momondo",
+        "kayak",
+        "skyscanner",
     ]
     if raw_advice and not any(kw in raw_advice.lower() for kw in forbidden_advice_keywords):
         advice_line = f"• <b>Besonderheiten:</b> {html.escape(raw_advice)}\n"
@@ -1096,7 +1151,9 @@ def build_telegram_message(deal: FlightDealEvaluation, title: str, url: str, sam
         price_line = f"• <b>Preis:</b> ~{deal.price_eur} € 📉 <i>(-{diff} € gegenüber bisher ~{prev_price} €!)</i> (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
     else:
         header_line = f"✈️ <b>{html.escape(deal.deal_category)}</b>"
-        price_line = f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
+        price_line = (
+            f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
+        )
 
     msg = (
         f"{header_line}\n\n"
@@ -1121,18 +1178,17 @@ def send_telegram(
     url: str,
     sample_booking: str = "",
     session: requests.Session | None = None,
-    prev_price: int = 0
+    prev_price: int = 0,
 ):
     msg = build_telegram_message(deal, title, url, sample_booking, prev_price=prev_price)
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     s = session or SESSION
     for attempt in range(3):
-        resp = s.post(tg_url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=15)
+        resp = s.post(
+            tg_url,
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=15,
+        )
         if resp.status_code == 429:
             retry_after = int(resp.json().get("parameters", {}).get("retry_after", 10))
             logging.warning(f"Telegram Rate Limit. Warte {retry_after}s...")
@@ -1147,6 +1203,7 @@ def fetch_flynous_synthetic_rss() -> str:
     try:
         from curl_cffi import requests as cffi_requests
         from selectolax.lexbor import LexborHTMLParser
+
         r = cffi_requests.get("https://www.flynous.com/", impersonate="chrome124", timeout=15)
         if r.status_code != 200:
             logging.warning(f"Flynous HTML-Abruf fehlgeschlagen mit Status {r.status_code}")
@@ -1187,6 +1244,7 @@ def fetch_secretflying_synthetic_rss() -> str:
     try:
         from curl_cffi import requests as cffi_requests
         from selectolax.lexbor import LexborHTMLParser
+
         r = cffi_requests.get("https://www.secretflying.com/euro-deals/", impersonate="chrome124", timeout=15)
         if r.status_code != 200:
             logging.warning(f"Secret Flying HTML-Abruf fehlgeschlagen mit Status {r.status_code}")
@@ -1252,7 +1310,7 @@ def fetch_all_feeds(
     feed_urls: list[str],
     max_workers: int | None = None,
     session: requests.Session | None = None,
-    max_entries_per_feed: int | None = None
+    max_entries_per_feed: int | None = None,
 ) -> list[tuple[str, list[dict[str, Any]]]]:
     """
     Lädt alle Feeds parallel mit ThreadPoolExecutor herunter und bewahrt die Feed-Reihenfolge.
@@ -1291,7 +1349,9 @@ def fetch_all_feeds(
     total_entries = sum(len(entries) for entries in results_map.values())
 
     if active_feeds == total_feeds:
-        logging.info(f"Feed-Scan erfolgreich: {active_feeds}/{total_feeds} Feeds aktiv ({total_entries} Einträge geladen).")
+        logging.info(
+            f"Feed-Scan erfolgreich: {active_feeds}/{total_feeds} Feeds aktiv ({total_entries} Einträge geladen)."
+        )
     else:
         logging.warning(
             f"Feed-Scan unvollständig: {active_feeds}/{total_feeds} Feeds aktiv. "
@@ -1316,10 +1376,16 @@ def main():
 
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM seen_urls")
-    is_new_db = (c.fetchone()[0] == 0)
+    is_new_db = c.fetchone()[0] == 0
 
-    seed_mode = os.environ.get("INITIAL_SEED_MODE", CONFIG.get("system", {}).get("initial_seed_mode", "eval_recent")).strip().lower()
-    seed_max_deals = int(os.environ.get("INITIAL_SEED_MAX_DEALS", CONFIG.get("system", {}).get("initial_seed_max_deals", 5)))
+    seed_mode = (
+        os.environ.get("INITIAL_SEED_MODE", CONFIG.get("system", {}).get("initial_seed_mode", "eval_recent"))
+        .strip()
+        .lower()
+    )
+    seed_max_deals = int(
+        os.environ.get("INITIAL_SEED_MAX_DEALS", CONFIG.get("system", {}).get("initial_seed_max_deals", 5))
+    )
 
     if is_new_db:
         logging.info(
@@ -1417,15 +1483,25 @@ def main():
                         send_telegram(deal, title, raw_link, sample_booking, prev_price=prev_price)
                         record_sent_deal(conn, deal)
                         if send_reason == "price_drop":
-                            logging.info(f"Deal-Preisupdate gepusht: {fingerprint} ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})")
+                            logging.info(
+                                f"Deal-Preisupdate gepusht: {fingerprint} ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
+                            )
                         else:
                             logging.info(f"Neuer Deal gepusht: {fingerprint} ({deal.price_eur}€, {deal.airline_names})")
                         time.sleep(2)
                     else:
-                        logging.info(f"Cross-Feed-Duplikat unterdrückt: {fingerprint} ({deal.price_eur}€, bestehend: {prev_price}€)")
+                        logging.info(
+                            f"Cross-Feed-Duplikat unterdrückt: {fingerprint} ({deal.price_eur}€, bestehend: {prev_price}€)"
+                        )
                 else:
-                    reason = deal.rejection_reason if getattr(deal, "rejection_reason", None) else f"Kategorie: {deal.deal_category}"
-                    logging.info(f"Deal verworfen ({deal.iata_origin}->{deal.iata_destination}, {deal.price_eur}€, {deal.airline_names}): {reason}")
+                    reason = (
+                        deal.rejection_reason
+                        if getattr(deal, "rejection_reason", None)
+                        else f"Kategorie: {deal.deal_category}"
+                    )
+                    logging.info(
+                        f"Deal verworfen ({deal.iata_origin}->{deal.iata_destination}, {deal.price_eur}€, {deal.airline_names}): {reason}"
+                    )
 
                 # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL als gesehen speichern
                 c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
