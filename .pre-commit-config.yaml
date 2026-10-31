@@ -1,0 +1,32 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.10
+    hooks:
+      - id: ruff
+        name: Ruff Linter (Auto-Fix)
+        args: [--fix]
+      - id: ruff-format
+        name: Ruff Formatter
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.8.3
+    hooks:
+      - id: bandit
+        name: Bandit Security Scan
+        args: ["-x", "tests,test_suite.py,.venv", "-ll"]
+        exclude: ^(tests/|test_suite\.py|\.venv/)
+
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.0
+    hooks:
+      - id: gitleaks
+        name: Gitleaks Secret Detector
+
+  - repo: local
+    hooks:
+      - id: root-clean-check
+        name: Root Clean Check (Keine SQLite-Dateien im Root)
+        entry: >-
+          .venv/bin/python -c "from pathlib import Path; import sys; db=[f.name for f in Path('.').glob('*.db*')]; sys.exit(f'Forbidden root DB files: {db}') if db else None"
+        language: system
+        pass_filenames: false

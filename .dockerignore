@@ -1,0 +1,33 @@
+# Git & CI
+.git/
+.github/
+.gitignore
+.dockerignore
+.pre-commit-config.yaml
+dependabot.yml
+
+# Secrets & Daten
+.env
+.env.*
+!.env.example
+data/
+*.db
+*.sqlite*
+
+# Entwicklungs-, Test- & Dokumentationsdateien
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+tests/
+test_*.py
+run_batch_push.py
+run_initial_evaluation.py
+STATUS_BOOSTER_MODULE.md
+README.md
+*.sarif
+bandit-report.json

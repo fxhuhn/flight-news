@@ -1,0 +1,51 @@
+# ==============================================================================
+# FLIGHT DEAL BOT - KONFIGURATION
+# ==============================================================================
+
+[origin]
+# Eigener Heimatflughafen für Zubringer- und Positionierungsflüge
+home_airport = "HAM"
+
+# Bevorzugte Startflughäfen/Hubs (Direktabflüge oder unkomplizierte Zubringer ohne extra Positionierungsaufwand)
+preferred_hubs = ["HAM", "FRA", "BER", "CPH"]
+
+[destinations]
+# Erlaubte Zielregionen für Deals
+regions = ["Asien", "Südamerika", "Mittelamerika"]
+
+# Spezifische Nahost-/QP-Airports (Miles & More Interkontinental-Sweet-Spots: bringen 200 Points + 200 QP)
+sweet_spots = ["DXB", "AUH", "JED", "AMM", "TLV", "BEY"]
+
+[pricing]
+# Maximalpreis in EUR Return ab den bevorzugten Hubs (HAM, FRA, BER, CPH)
+max_price_home_hubs = 2200
+
+# Maximalpreis in EUR Return für Ex-EU Abflüge (z.B. WAW, OSL, ARN, DUB, MXP, AMS, BUD)
+max_price_ex_eu = 1750
+
+# Maximalpreis in EUR Return für Ex-EU bei nachgewiesenen Top-Kabinen (z.B. Qsuite, Etihad A350/787)
+max_price_top_cabin_ex_eu = 1900
+
+[airlines]
+# Airlines, die bei den Angeboten ignoriert werden sollen (Ausschluss nach Name oder IATA-Code).
+# Deals dieser Airlines werden nicht als Angebot angezeigt und direkt verworfen.
+ignored_airlines = [
+    "Azerbaijan Airlines",
+    "AZAL",
+    "Turkmenistan Airlines",
+    "T5",
+    "MIAT",
+    "Mongolian Airlines",
+]
+
+[system]
+# Modus beim Start mit neuer/leerer Datenbank:
+# "eval_recent" = (Standard) Bewertet die Top-N neuesten Deals sofort & markiert den Rest als gesehen
+# "silent"      = Stummes Befüllen (alle vorhandenen Deals als gesehen markieren, erst ab Zyklus 2 bewerten)
+# "off"         = Deaktiviert (normale Endlosverarbeitung aller vorhandenen Einträge)
+initial_seed_mode = "eval_recent"
+initial_seed_max_deals = 5
+
+# Maximale Anzahl an Einträgen, die pro RSS-Feed pro Scan ausgewertet werden
+max_entries_per_feed = 25
+
