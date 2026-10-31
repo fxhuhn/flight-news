@@ -1,6 +1,6 @@
 curl_cffi==0.16.3
 fast-flights==3.1.0
-feedparser==6.0.11
+feedparser==6.0.14
 google-genai==1.2.0
 lxml_html_clean==0.4.5
 pydantic==2.10.6
