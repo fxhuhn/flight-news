@@ -2,21 +2,21 @@ import os
 import tempfile
 
 from bot import (
+    IGNORED_AIRLINES,
     FlightDealEvaluation,
     build_gf_main_url,
     build_positioning_url,
+    build_telegram_message,
     clean_html,
-    normalize_url,
-    is_feed_entry_eligible_pre_filter,
-    validate_deal_safety,
-    IGNORED_AIRLINES,
+    init_db,
     is_airline_ignored_in_text,
     is_deal_ignored_airline,
-    build_telegram_message,
-    init_db,
-    should_send_deal,
-    record_sent_deal,
+    is_feed_entry_eligible_pre_filter,
     normalize_and_verify_deal_mm_points,
+    normalize_url,
+    record_sent_deal,
+    should_send_deal,
+    validate_deal_safety,
 )
 
 
@@ -196,7 +196,9 @@ def test_airline_ignore_filter():
     )
 
     deal_t5 = base_deal.model_copy(update={"primary_airline_iata": "T5", "airline_names": "Turkmenistan Airlines (T5)"})
-    deal_azal = base_deal.model_copy(update={"primary_airline_iata": "J2", "airline_names": "Azerbaijan Airlines (AZAL)"})
+    deal_azal = base_deal.model_copy(
+        update={"primary_airline_iata": "J2", "airline_names": "Azerbaijan Airlines (AZAL)"}
+    )
     deal_swiss = base_deal.model_copy(update={"primary_airline_iata": "LX", "airline_names": "SWISS (LX)"})
 
     ignored_t5, _ = is_deal_ignored_airline(deal_t5)
