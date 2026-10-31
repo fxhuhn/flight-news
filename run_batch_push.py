@@ -1,36 +1,29 @@
-import html
 import logging
-import os
-import sys
 import time
 from datetime import datetime
-from pathlib import Path
+
 import feedparser
 from google import genai
 
 from bot import (
     GEMINI_API_KEY,
-    GEMINI_MODEL,
-    HEADERS,
+    IGNORED_AIRLINES,
     NEGATIVE_KEYWORDS,
     RSS_FEEDS,
-    clean_html,
-    cleanup_db,
     evaluate_with_gemini,
-    extract_deal_context,
+    fetch_feed_content,
     get_enriched_deal_context,
     init_db,
+    is_airline_ignored_in_text,
     normalize_url,
     send_telegram,
     validate_startup,
-    fetch_feed_content,
-    IGNORED_AIRLINES,
-    is_airline_ignored_in_text
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 TARGET_COUNT = 20
+
 
 def run_batch():
     validate_startup()
@@ -110,36 +103,46 @@ def run_batch():
             full_text, sample_booking = get_enriched_deal_context(raw_content, raw_link)
 
             evaluated_count += 1
-            print(f"[{sent_count+1}/{TARGET_COUNT}] Analysiere ({evaluated_count}. Check): {title[:70]}...")
+            print(f"[{sent_count + 1}/{TARGET_COUNT}] Analysiere ({evaluated_count}. Check): {title[:70]}...")
 
             deal = evaluate_with_gemini(client, title, full_text)
 
             if deal.is_relevant and deal.deal_category != "Irrelevant":
                 price_bucket = round(deal.price_eur / 100) * 100
                 fingerprint = f"{deal.iata_origin}-{deal.iata_destination}-{price_bucket}"
-                
+
                 c.execute("SELECT 1 FROM sent_deals WHERE deal_fingerprint = ?", (fingerprint,))
                 if not c.fetchone():
                     # Telegram Push
                     send_telegram(deal, title, raw_link, sample_booking)
                     c.execute("INSERT INTO sent_deals (deal_fingerprint) VALUES (?)", (fingerprint,))
                     sent_count += 1
-                    
-                    pushed_deals.append({
-                        "nr": sent_count,
-                        "airline": deal.airline_names,
-                        "route": f"{deal.iata_origin}->{deal.iata_destination}",
-                        "price": f"{deal.price_eur} €",
-                        "points": f"{deal.mm_points} P / {deal.mm_qualifying_points} QP",
-                        "title": title[:60]
-                    })
-                    print(f"  👉 GEPUSHT (#{sent_count}): {deal.iata_origin}->{deal.iata_destination} | {deal.price_eur}€ | {deal.airline_names} | {deal.mm_points}P/{deal.mm_qualifying_points}QP")
+
+                    pushed_deals.append(
+                        {
+                            "nr": sent_count,
+                            "airline": deal.airline_names,
+                            "route": f"{deal.iata_origin}->{deal.iata_destination}",
+                            "price": f"{deal.price_eur} €",
+                            "points": f"{deal.mm_points} P / {deal.mm_qualifying_points} QP",
+                            "title": title[:60],
+                        }
+                    )
+                    print(
+                        f"  👉 GEPUSHT (#{sent_count}): {deal.iata_origin}->{deal.iata_destination} | {deal.price_eur}€ | {deal.airline_names} | {deal.mm_points}P/{deal.mm_qualifying_points}QP"
+                    )
                     time.sleep(2)  # Pause für Telegram Rate-Limits
                 else:
                     print(f"  ⏭️ Cross-Feed Duplikat: {fingerprint}")
             else:
-                reason = deal.rejection_reason if getattr(deal, "rejection_reason", None) else f"Kategorie: {deal.deal_category}, Region: {deal.region}"
-                print(f"  ❌ Abgelehnt: {deal.iata_origin}->{deal.iata_destination} | {deal.price_eur}€ | {deal.airline_names} | Grund: {reason}")
+                reason = (
+                    deal.rejection_reason
+                    if getattr(deal, "rejection_reason", None)
+                    else f"Kategorie: {deal.deal_category}, Region: {deal.region}"
+                )
+                print(
+                    f"  ❌ Abgelehnt: {deal.iata_origin}->{deal.iata_destination} | {deal.price_eur}€ | {deal.airline_names} | Grund: {reason}"
+                )
 
             # URL als gesehen markieren
             c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
@@ -158,6 +161,7 @@ def run_batch():
     for d in pushed_deals:
         print(f"#{d['nr']:02d} | {d['route']} | {d['price']:>7} | {d['points']:>15} | {d['airline']} ({d['title']})")
     print("=" * 65)
+
 
 if __name__ == "__main__":
     run_batch()
