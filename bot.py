@@ -203,6 +203,7 @@ def load_config() -> dict[str, Any]:
             "initial_seed_mode": "eval_recent",
             "initial_seed_max_deals": 5,
             "max_entries_per_feed": 25,
+            "sent_deals_retention_days": 21,
         },
     }
     if CONFIG_PATH.exists():
@@ -232,6 +233,10 @@ IGNORED_AIRLINES: list[str] = [
 ]
 MAX_ENTRIES_PER_FEED: int = int(
     os.environ.get("MAX_ENTRIES_PER_FEED", CONFIG.get("system", {}).get("max_entries_per_feed", 25))
+)
+SENT_DEALS_RETENTION_DAYS: int = max(
+    1,
+    int(os.environ.get("SENT_DEALS_RETENTION_DAYS", CONFIG.get("system", {}).get("sent_deals_retention_days", 21))),
 )
 
 HEADERS = {
@@ -1150,11 +1155,19 @@ def close_db(conn: sqlite3.Connection | None) -> None:
         conn.close()
 
 
-def cleanup_db(conn: sqlite3.Connection) -> None:
+def cleanup_db(conn: sqlite3.Connection, sent_deals_retention_days: int | None = None) -> None:
+    retention_days = max(
+        1,
+        int(SENT_DEALS_RETENTION_DAYS if sent_deals_retention_days is None else sent_deals_retention_days),
+    )
+    cutoff_modifier = f"-{retention_days} days"
     with closing(conn.cursor()) as c:
         c.execute("DELETE FROM seen_urls WHERE created_at < datetime('now', '-90 days')")
         deleted_urls = max(0, c.rowcount)
-        c.execute("DELETE FROM sent_deals WHERE COALESCE(updated_at, created_at) < datetime('now', '-7 days')")
+        c.execute(
+            "DELETE FROM sent_deals WHERE COALESCE(updated_at, created_at) < datetime('now', ?)",
+            (cutoff_modifier,),
+        )
         deleted_deals = max(0, c.rowcount)
     conn.commit()
     if (deleted_urls + deleted_deals) > 0:

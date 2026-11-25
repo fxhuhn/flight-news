@@ -718,8 +718,13 @@ def test_wal_checkpoint_cleanup_and_cycle_close():
         )
         c.execute(
             "INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, created_at, updated_at) "
-            "VALUES (?, 1500, 'LH', datetime('now', '-10 days'), datetime('now', '-10 days'))",
+            "VALUES (?, 1500, 'LH', datetime('now', '-25 days'), datetime('now', '-25 days'))",
             ("FRA-BKK-LH",),
+        )
+        c.execute(
+            "INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, created_at, updated_at) "
+            "VALUES (?, 1800, 'LO', datetime('now', '-10 days'), datetime('now', '-10 days'))",
+            ("VIE-DEL-LO",),
         )
         conn.commit()
         c.close()
@@ -731,17 +736,21 @@ def test_wal_checkpoint_cleanup_and_cycle_close():
         checkpoint_db(conn)
         assert os.path.getsize(wal_path) == 0
 
-        # 2. cleanup_db löscht abgelaufene Zeilen, kompaktiert via VACUUM und hält -wal auf 0 Byte
+        # 2. cleanup_db löscht abgelaufene Zeilen (>21 Tage), behält neuere (10 Tage) und hält -wal auf 0 Byte
         cleanup_db(conn)
         assert os.path.getsize(wal_path) == 0
         remaining_old = conn.execute(
             "SELECT COUNT(*) FROM seen_urls WHERE url_clean = 'https://example.com/old-url'"
         ).fetchone()[0]
         assert remaining_old == 0
-        remaining_deals = conn.execute(
+        remaining_expired_deals = conn.execute(
             "SELECT COUNT(*) FROM sent_deals WHERE deal_fingerprint = 'FRA-BKK-LH'"
         ).fetchone()[0]
-        assert remaining_deals == 0
+        assert remaining_expired_deals == 0
+        remaining_active_deals = conn.execute(
+            "SELECT COUNT(*) FROM sent_deals WHERE deal_fingerprint = 'VIE-DEL-LO'"
+        ).fetchone()[0]
+        assert remaining_active_deals == 1
 
         # 3. close_db schließt die Verbindung sauber -> -wal und -shm verschwinden vollständig
         close_db(conn)

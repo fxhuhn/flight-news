@@ -49,3 +49,6 @@ initial_seed_max_deals = 5
 # Maximale Anzahl an Einträgen, die pro RSS-Feed pro Scan ausgewertet werden
 max_entries_per_feed = 25
 
+# Haltedauer (in Tagen) für gesendete Deals in sent_deals (Duplikatsperre & Preissturz-Historie)
+sent_deals_retention_days = 21
+
