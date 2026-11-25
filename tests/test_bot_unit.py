@@ -8,20 +8,26 @@ import requests
 from google.genai import types
 
 from bot import (
+    CONFIG,
     IGNORED_AIRLINES,
     ActivityWatchdog,
     FlightDealEvaluation,
     build_gf_main_url,
     build_positioning_url,
     build_telegram_message,
+    checkpoint_db,
     clean_html,
+    cleanup_db,
+    close_db,
     create_genai_client,
+    evaluate_with_gemini,
     format_deal_route_plain,
     generate_with_gemini_fallback,
     init_db,
     is_airline_ignored_in_text,
     is_deal_ignored_airline,
     is_feed_entry_eligible_pre_filter,
+    main,
     normalize_and_verify_deal_mm_points,
     normalize_iata_via,
     normalize_url,
@@ -596,3 +602,167 @@ def test_activity_watchdog_and_cycle_wait():
         interrupted = wait_for_next_cycle(30, stop_event=cycle_stop, watchdog=wd_active, heartbeat_interval=1)
         assert interrupted is True
         assert (time.monotonic() - t0) < 2.0
+
+
+def test_wal_checkpoint_cleanup_and_cycle_close():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "deals.db")
+        wal_path = f"{db_path}-wal"
+        shm_path = f"{db_path}-shm"
+
+        conn = init_db(db_path)
+        limit_row = conn.execute("PRAGMA journal_size_limit;").fetchone()
+        assert limit_row is not None and limit_row[0] == 65536
+
+        # Schreibe zahlreiche Zeilen, sodass die WAL-Datei befüllt wird
+        c = conn.cursor()
+        for i in range(250):
+            c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (f"https://example.com/deal-{i}",))
+        # Füge veraltete Einträge hinzu, die cleanup_db löschen und per VACUUM kompaktieren muss
+        c.execute(
+            "INSERT INTO seen_urls (url_clean, created_at) VALUES (?, datetime('now', '-120 days'))",
+            ("https://example.com/old-url",),
+        )
+        c.execute(
+            "INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, created_at, updated_at) "
+            "VALUES (?, 1500, 'LH', datetime('now', '-10 days'), datetime('now', '-10 days'))",
+            ("FRA-BKK-LH",),
+        )
+        conn.commit()
+        c.close()
+
+        assert os.path.exists(wal_path)
+        assert os.path.getsize(wal_path) > 0
+
+        # 1. checkpoint_db kürzt die -wal-Datei bei offener Verbindung sofort auf 0 Byte
+        checkpoint_db(conn)
+        assert os.path.getsize(wal_path) == 0
+
+        # 2. cleanup_db löscht abgelaufene Zeilen, kompaktiert via VACUUM und hält -wal auf 0 Byte
+        cleanup_db(conn)
+        assert os.path.getsize(wal_path) == 0
+        remaining_old = conn.execute(
+            "SELECT COUNT(*) FROM seen_urls WHERE url_clean = 'https://example.com/old-url'"
+        ).fetchone()[0]
+        assert remaining_old == 0
+        remaining_deals = conn.execute(
+            "SELECT COUNT(*) FROM sent_deals WHERE deal_fingerprint = 'FRA-BKK-LH'"
+        ).fetchone()[0]
+        assert remaining_deals == 0
+
+        # 3. close_db schließt die Verbindung sauber -> -wal und -shm verschwinden vollständig
+        close_db(conn)
+        assert os.path.exists(db_path)
+        assert not os.path.exists(wal_path)
+        assert not os.path.exists(shm_path)
+
+        # 4. Prüfe, dass main() während wait_for_next_cycle keine offenen -wal/-shm Dateien hinterlässt
+        hb_path = os.path.join(tmpdir, "heartbeat")
+        observed_during_sleep: dict[str, bool] = {}
+
+        def fake_wait(*args, **kwargs) -> bool:
+            observed_during_sleep["wal_exists"] = os.path.exists(wal_path)
+            observed_during_sleep["shm_exists"] = os.path.exists(shm_path)
+            return True  # Beende Hauptschleife nach 1 Zyklus
+
+        fake_entries = [
+            (
+                "https://travel-dealz.de/kategorie/fluege/business-class/feed/",
+                [{"title": "Frage: Meilen kaufen", "link": "https://example.com/ignored-question"}],
+            )
+        ]
+
+        with (
+            patch("bot.DB_PATH", db_path),
+            patch("bot.HEARTBEAT_FILE", hb_path),
+            patch("bot.validate_startup"),
+            patch("bot.create_genai_client", return_value=MagicMock()),
+            patch("bot.fetch_all_feeds", return_value=fake_entries),
+            patch("bot.wait_for_next_cycle", side_effect=fake_wait),
+            patch("bot.STOP_EVENT", threading.Event()),
+        ):
+            main()
+
+        assert observed_during_sleep == {"wal_exists": False, "shm_exists": False}
+        assert not os.path.exists(wal_path)
+        assert not os.path.exists(shm_path)
+
+
+def test_central_asia_region_integration():
+    # 1. Konfiguration enthält Zentralasien standardmäßig & angehobene Preislimits (2400 / 1900 / 1950)
+    assert "Zentralasien" in CONFIG["destinations"]["regions"]
+    assert "Ozeanien" not in CONFIG["destinations"]["regions"]
+    assert {"DWC", "RUH", "MCT", "SLL", "DOH", "AQJ"}.issubset(set(CONFIG["destinations"]["sweet_spots"]))
+    assert CONFIG["pricing"]["max_price_home_hubs"] == 2400
+    assert CONFIG["pricing"]["max_price_ex_eu"] == 1900
+    assert CONFIG["pricing"]["max_price_top_cabin_ex_eu"] == 1950
+
+    # 2. FlightDealEvaluation akzeptiert 'Zentralasien' als eigene Region (z.B. TK FRA -> IST -> NQZ)
+    deal_nqz = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Turkish Airlines Business Class ab Frankfurt nach Astana",
+        is_relevant=True,
+        deal_category="Star Alliance (Nur Points)",
+        airline_names="Turkish Airlines (TK)",
+        primary_airline_iata="TK",
+        iata_origin="FRA",
+        iata_via=[],
+        iata_destination="NQZ",
+        is_open_jaw=False,
+        iata_return_end="FRA",
+        region="Zentralasien",
+        sample_outbound_date="2027-02-10",
+        sample_return_date="2027-02-20",
+        price_eur=2089,
+        booking_class="K",
+        mm_points=480,
+        mm_qualifying_points=0,
+        cabin_assessment="Lie-Flat / Recliner Mix",
+        routing_advice="",
+        rejection_reason="",
+    )
+    assert resolve_deal_stops(deal_nqz) == ["IST"]
+    safe_valid, _ = validate_deal_safety(
+        deal_nqz,
+        "Turkish Airlines Business Class von Frankfurt nach Astana",
+        "Fliege in der Turkish Airlines Business Class ab Frankfurt (FRA) nach Astana (NQZ) für 2.089 Euro.",
+    )
+    assert safe_valid is True
+
+    # 3. Preisplausibilitäts-Airbag (< 750 € ohne Error Fare) greift auch bei Zentralasien
+    deal_cheap = deal_nqz.model_copy(update={"price_eur": 372})
+    safe_cheap, veto_reason = validate_deal_safety(
+        deal_cheap,
+        "Flüge nach Astana",
+        "Turkish Airlines Flüge ab Frankfurt (FRA) nach Astana (NQZ) für 372 Euro.",
+    )
+    assert safe_cheap is False
+    assert "Unplausibler Langstreckenpreis" in veto_reason
+
+    # 4. evaluate_with_gemini übergibt den expliziten Zentralasien-Hinweis im Prompt (auch bei Legacy-Config nur mit 'Asien')
+    captured_prompts: list[str] = []
+    mock_resp = MagicMock()
+    mock_resp.parsed = deal_nqz
+
+    def fake_gen(client, prompt, **kwargs):
+        captured_prompts.append(prompt)
+        return mock_resp
+
+    with (
+        patch.dict(CONFIG["destinations"], {"regions": ["Asien", "Südamerika", "Mittelamerika"]}),
+        patch("bot.generate_with_gemini_fallback", side_effect=fake_gen),
+    ):
+        evaluated = evaluate_with_gemini(
+            MagicMock(),
+            "Turkish Airlines Business Class Frankfurt Astana",
+            "Business Class ab Frankfurt (FRA) nach Astana (NQZ) ab 2.089 Euro.",
+        )
+
+    assert evaluated.iata_via == ["IST"]
+    assert len(captured_prompts) == 1
+    assert "ZENTRALASIEN" in captured_prompts[0]
+    assert "Kasachstan" in captured_prompts[0]
+    assert "Usbekistan" in captured_prompts[0]
+    assert "Australien / Ozeanien" in captured_prompts[0]
+    assert "max. 2400 EUR Return" in captured_prompts[0]
+    assert "max. 1900 EUR Return (bis 1950 EUR" in captured_prompts[0]

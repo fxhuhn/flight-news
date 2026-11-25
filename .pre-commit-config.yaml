@@ -13,8 +13,8 @@ repos:
     hooks:
       - id: bandit
         name: Bandit Security Scan
-        args: ["-x", "tests,test_suite.py,.venv", "-ll"]
-        exclude: ^(tests/|test_suite\.py|\.venv/)
+        args: ["-x", "tests,.venv", "-ll"]
+        exclude: ^(tests/|\.venv/)
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.24.0

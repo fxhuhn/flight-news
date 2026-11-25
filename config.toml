@@ -10,21 +10,21 @@ home_airport = "HAM"
 preferred_hubs = ["HAM", "FRA", "BER", "CPH"]
 
 [destinations]
-# Erlaubte Zielregionen für Deals
-regions = ["Asien", "Südamerika", "Mittelamerika"]
+# Erlaubte Zielregionen für Deals (Asien umfasst Ost-, Südost-, Süd- und Zentralasien)
+regions = ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"]
 
 # Spezifische Nahost-/QP-Airports (Miles & More Interkontinental-Sweet-Spots: bringen 200 Points + 200 QP)
-sweet_spots = ["DXB", "AUH", "JED", "AMM", "TLV", "BEY"]
+sweet_spots = ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"]
 
 [pricing]
 # Maximalpreis in EUR Return ab den bevorzugten Hubs (HAM, FRA, BER, CPH)
-max_price_home_hubs = 2200
+max_price_home_hubs = 2400
 
-# Maximalpreis in EUR Return für Ex-EU Abflüge (z.B. WAW, OSL, ARN, DUB, MXP, AMS, BUD)
-max_price_ex_eu = 1750
+# Maximalpreis in EUR Return für Ex-EU Abflüge (z.B. WAW, OSL, ARN, TLL, PRG, DUB, MXP, AMS, BUD)
+max_price_ex_eu = 1900
 
-# Maximalpreis in EUR Return für Ex-EU bei nachgewiesenen Top-Kabinen (z.B. Qsuite, Etihad A350/787)
-max_price_top_cabin_ex_eu = 1900
+# Maximalpreis in EUR Return für Ex-EU bei nachgewiesenen Top-Kabinen (z.B. Qsuite, Etihad A350/787, Turkish Airlines A350/787)
+max_price_top_cabin_ex_eu = 1950
 
 [airlines]
 # Airlines, die bei den Angeboten ignoriert werden sollen (Ausschluss nach Name oder IATA-Code).

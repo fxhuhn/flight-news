@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -181,13 +182,13 @@ def load_config() -> dict[str, Any]:
             "preferred_hubs": ["HAM", "FRA", "BER", "CPH"],
         },
         "destinations": {
-            "regions": ["Asien", "Südamerika", "Mittelamerika"],
-            "sweet_spots": ["DXB", "AUH", "JED", "AMM", "TLV", "BEY"],
+            "regions": ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"],
+            "sweet_spots": ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"],
         },
         "pricing": {
-            "max_price_home_hubs": 2200,
-            "max_price_ex_eu": 1750,
-            "max_price_top_cabin_ex_eu": 1900,
+            "max_price_home_hubs": 2400,
+            "max_price_ex_eu": 1900,
+            "max_price_top_cabin_ex_eu": 1950,
         },
         "airlines": {
             "ignored_airlines": [
@@ -339,9 +340,6 @@ WEAK_NEGATIVE_KEYWORDS = [
     "upgrade voucher",
 ]
 
-# Abwärtskompatibilität für Imports aus test_suite.py und run_batch_push.py
-NEGATIVE_KEYWORDS = HARD_NEGATIVE_KEYWORDS + WEAK_NEGATIVE_KEYWORDS
-
 
 def is_feed_entry_eligible_pre_filter(entry_title: str, entry_content: str, feed_url: str = "") -> tuple[bool, str]:
     """
@@ -465,7 +463,13 @@ class FlightDealEvaluation(BaseModel):
     iata_return_end: str = Field(
         description="3-Letter IATA Code des Rückflug-Endpunkts (identisch mit iata_origin bei normalem Return)"
     )
-    region: Literal["Asien", "Südamerika", "Mittelamerika", "Nahost", "Sonstige"]
+    region: Literal["Asien", "Zentralasien", "Südamerika", "Mittelamerika", "Nahost", "Sonstige"] = Field(
+        description=(
+            "Zielregion des Hauptziels: 'Asien' (Ost-, Südost- und Südasien inkl. Japan, Südkorea, Indien, Malediven), "
+            "'Zentralasien' (Kasachstan z.B. ALA/NQZ/TSE, Usbekistan z.B. TAS/SKD, Kirgisistan FRU, Tadschikistan DYU), "
+            "'Südamerika', 'Mittelamerika' (inkl. Karibik/Mexiko), 'Nahost' oder 'Sonstige' (z.B. Europa, Nordamerika, Afrika, Australien/Ozeanien)."
+        )
+    )
     sample_outbound_date: str = Field(
         description="Hinflugdatum im Format YYYY-MM-DD aus dem Artikel/Buchungslink oder plausibles Datum im Reisezeitraum"
     )
@@ -834,7 +838,7 @@ def resolve_deal_stops(deal: FlightDealEvaluation) -> list[str]:
         return []
     if primary == "TK" and (orig in {"IST", "SAW", "ESB", "AYT", "ADB"} or dest in {"IST", "SAW", "ESB", "AYT", "ADB"}):
         return []
-    if primary == "SQ" and deal.region == "Asien" and orig != "SIN" and dest != "SIN":
+    if primary == "SQ" and deal.region in ("Asien", "Zentralasien") and orig != "SIN" and dest != "SIN":
         return ["SIN"]
     if primary == "LH" and orig not in {"FRA", "MUC"} and dest not in {"FRA", "MUC"}:
         return ["FRA/MUC"]
@@ -875,9 +879,9 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
         return False, "Kein Textnachweis für Business/First Class vorhanden"
 
     # 2. Langstrecken-Preisplausibilität
-    # Flüge nach Asien, Südamerika, Mittelamerika kosten in Business regulär >= 1.000 €.
+    # Flüge nach Asien, Zentralasien, Südamerika, Mittelamerika kosten in Business regulär >= 1.000 €.
     # Preise < 750 € Return sind zu 99% Economy-Tarife, außer es ist ausdrücklich ein Error Fare.
-    if deal.region in ("Asien", "Südamerika", "Mittelamerika") and deal.price_eur < 750:
+    if deal.region in ("Asien", "Zentralasien", "Südamerika", "Mittelamerika") and deal.price_eur < 750:
         combined_lower = f"{title} {full_text}".lower()
         if not any(ef in combined_lower for ef in ("error fare", "error-fare", "preisfehler", "errorfare")):
             return (
@@ -961,36 +965,62 @@ def validate_startup():
 
 
 def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
-    os.makedirs(os.path.dirname(db_path), exist_ok=True)
+    db_dir = os.path.dirname(db_path)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL;")
-    c = conn.cursor()
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS seen_urls (url_clean TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-    )
-    c.execute(
-        "CREATE TABLE IF NOT EXISTS sent_deals (deal_fingerprint TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
-    )
+    conn.execute("PRAGMA journal_size_limit=65536;")
+    with closing(conn.cursor()) as c:
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS seen_urls (url_clean TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        c.execute(
+            "CREATE TABLE IF NOT EXISTS sent_deals (deal_fingerprint TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
 
-    # Automatische sanfte Schema-Migration für bestehende Datenbanken
-    c.execute("PRAGMA table_info(sent_deals)")
-    existing_cols = {col[1] for col in c.fetchall()}
-    if "price_eur" not in existing_cols:
-        c.execute("ALTER TABLE sent_deals ADD COLUMN price_eur INTEGER DEFAULT 0")
-    if "airline_code" not in existing_cols:
-        c.execute("ALTER TABLE sent_deals ADD COLUMN airline_code TEXT DEFAULT ''")
-    if "updated_at" not in existing_cols:
-        c.execute("ALTER TABLE sent_deals ADD COLUMN updated_at TIMESTAMP")
+        # Automatische sanfte Schema-Migration für bestehende Datenbanken
+        c.execute("PRAGMA table_info(sent_deals)")
+        existing_cols = {col[1] for col in c.fetchall()}
+        if "price_eur" not in existing_cols:
+            c.execute("ALTER TABLE sent_deals ADD COLUMN price_eur INTEGER DEFAULT 0")
+        if "airline_code" not in existing_cols:
+            c.execute("ALTER TABLE sent_deals ADD COLUMN airline_code TEXT DEFAULT ''")
+        if "updated_at" not in existing_cols:
+            c.execute("ALTER TABLE sent_deals ADD COLUMN updated_at TIMESTAMP")
 
     conn.commit()
     return conn
 
 
-def cleanup_db(conn: sqlite3.Connection):
-    c = conn.cursor()
-    c.execute("DELETE FROM seen_urls WHERE created_at < datetime('now', '-90 days')")
-    c.execute("DELETE FROM sent_deals WHERE COALESCE(updated_at, created_at) < datetime('now', '-7 days')")
+def checkpoint_db(conn: sqlite3.Connection) -> None:
+    """Schreibt alle WAL-Änderungen in die Hauptdatenbank zurück und kürzt die -wal-Datei auf 0 Byte."""
     conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+
+def close_db(conn: sqlite3.Connection | None) -> None:
+    """Führt einen vollständigen WAL-Checkpoint aus und schließt die Verbindung sauber (entfernt -wal & -shm)."""
+    if conn is None:
+        return
+    try:
+        checkpoint_db(conn)
+    except sqlite3.Error as exc:
+        logging.warning(f"WAL-Checkpoint vor dem Schließen der DB fehlgeschlagen: {exc}")
+    finally:
+        conn.close()
+
+
+def cleanup_db(conn: sqlite3.Connection) -> None:
+    with closing(conn.cursor()) as c:
+        c.execute("DELETE FROM seen_urls WHERE created_at < datetime('now', '-90 days')")
+        deleted_urls = max(0, c.rowcount)
+        c.execute("DELETE FROM sent_deals WHERE COALESCE(updated_at, created_at) < datetime('now', '-7 days')")
+        deleted_deals = max(0, c.rowcount)
+    conn.commit()
+    if (deleted_urls + deleted_deals) > 0:
+        conn.execute("VACUUM;")
+    checkpoint_db(conn)
 
 
 def build_deal_fingerprint(deal: FlightDealEvaluation) -> str:
@@ -1026,18 +1056,18 @@ def should_send_deal(
     - Gibt (False, "duplicate", prev_price) zurück, wenn der Deal gleich teuer, teurer oder nur marginal billiger ist.
     """
     fp = build_deal_fingerprint(deal)
-    c = conn.cursor()
-    c.execute("SELECT price_eur, deal_fingerprint FROM sent_deals WHERE deal_fingerprint = ?", (fp,))
-    row = c.fetchone()
-
-    if not row:
-        # Fallback-Prüfung für Alt-DB-Einträge mit 100er-Buckets (z.B. "FRA-BKK-1700") während der Übergangsphase
-        price_bucket = round(deal.price_eur / 100) * 100
-        legacy_fp = f"{deal.iata_origin}-{deal.iata_destination}-{price_bucket}"
-        c.execute("SELECT price_eur, deal_fingerprint FROM sent_deals WHERE deal_fingerprint = ?", (legacy_fp,))
+    with closing(conn.cursor()) as c:
+        c.execute("SELECT price_eur, deal_fingerprint FROM sent_deals WHERE deal_fingerprint = ?", (fp,))
         row = c.fetchone()
+
         if not row:
-            return True, "new_deal", 0
+            # Fallback-Prüfung für Alt-DB-Einträge mit 100er-Buckets (z.B. "FRA-BKK-1700") während der Übergangsphase
+            price_bucket = round(deal.price_eur / 100) * 100
+            legacy_fp = f"{deal.iata_origin}-{deal.iata_destination}-{price_bucket}"
+            c.execute("SELECT price_eur, deal_fingerprint FROM sent_deals WHERE deal_fingerprint = ?", (legacy_fp,))
+            row = c.fetchone()
+            if not row:
+                return True, "new_deal", 0
 
     prev_price = row[0] or 0
     # Falls prev_price bei alten Einträgen 0 war, ermittle ihn aus legacy-Fingerprint falls möglich
@@ -1059,18 +1089,18 @@ def record_sent_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation):
     """Speichert oder aktualisiert den gesendeten Deal mit aktuellem Preis und Zeitstempel."""
     fp = build_deal_fingerprint(deal)
     airline_code = (deal.primary_airline_iata or "").strip().upper()
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, updated_at)
-        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(deal_fingerprint) DO UPDATE SET
-            price_eur = excluded.price_eur,
-            airline_code = excluded.airline_code,
-            updated_at = CURRENT_TIMESTAMP
-    """,
-        (fp, deal.price_eur, airline_code),
-    )
+    with closing(conn.cursor()) as c:
+        c.execute(
+            """
+            INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(deal_fingerprint) DO UPDATE SET
+                price_eur = excluded.price_eur,
+                airline_code = excluded.airline_code,
+                updated_at = CURRENT_TIMESTAMP
+        """,
+            (fp, deal.price_eur, airline_code),
+        )
     conn.commit()
 
 
@@ -1393,14 +1423,24 @@ def generate_with_gemini_fallback(
 
 def evaluate_with_gemini(client: genai.Client, title: str, clean_text: str) -> FlightDealEvaluation:
     hubs_str = ", ".join(sorted(PREFERRED_HUBS))
-    dest_regions = CONFIG["destinations"].get("regions", ["Asien", "Südamerika", "Mittelamerika"])
+    dest_regions = CONFIG["destinations"].get("regions", ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"])
     regions_str = ", ".join(dest_regions)
-    sweet_spots = CONFIG["destinations"].get("sweet_spots", ["DXB", "AUH", "JED", "AMM", "TLV", "BEY"])
+    central_asia_hint = ""
+    if any(r in dest_regions for r in ("Asien", "Zentralasien")):
+        central_asia_hint = (
+            "\n   - WICHTIG ZU ASIEN & ZENTRALASIEN: Neben Ost-, Südost- und Südasien (inkl. Japan, Korea, Indien, Malediven) "
+            "zählt auch ZENTRALASIEN (Kasachstan mit Almaty ALA & Astana NQZ/TSE, Usbekistan mit Taschkent TAS & Samarkand SKD, "
+            "Kirgisistan FRU, Tadschikistan DYU) VOLLUMFÄNGLICH zu den erlaubten Zielregionen! "
+            "Lehne Deals nach Kasachstan oder Usbekistan NIEMALS wegen der Zielregion ab!"
+            "\n   - AUSGESCHLOSSEN: Australien / Ozeanien (z.B. SYD, MEL, PER, ADL, AKL), Nordamerika, Afrika und Europa gehören NICHT zu Asien -> als region = 'Sonstige' und is_relevant = False ablehnen!"
+        )
+    sweet_spots = CONFIG["destinations"].get(
+        "sweet_spots", ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"]
+    )
     sweet_spots_str = ", ".join(sweet_spots)
-    price_hubs = CONFIG["pricing"].get("max_price_home_hubs", 2200)
-    price_ideal = max(0, price_hubs - 200)
-    price_ex_eu = CONFIG["pricing"].get("max_price_ex_eu", 1750)
-    price_top_cabin = CONFIG["pricing"].get("max_price_top_cabin_ex_eu", 1900)
+    price_hubs = CONFIG["pricing"].get("max_price_home_hubs", 2400)
+    price_ex_eu = CONFIG["pricing"].get("max_price_ex_eu", 1900)
+    price_top_cabin = CONFIG["pricing"].get("max_price_top_cabin_ex_eu", 1950)
     ignored_airlines = CONFIG.get("airlines", {}).get("ignored_airlines", IGNORED_AIRLINES)
     ignored_airlines_str = ", ".join(ignored_airlines) if ignored_airlines else "Keine"
 
@@ -1417,7 +1457,7 @@ STRIKTE REGELN FÜR 'is_relevant = True':
      * Setze is_relevant = False
      * Setze deal_category = 'Irrelevant'
      * Setze rejection_reason = 'Nur Economy / Keine Business Class explizit genannt'
-2. Zielregion: {regions_str} (oder Nahost-Sweet-Spots für Miles & More QP: {sweet_spots_str}).
+2. Zielregion: {regions_str} (oder Nahost-Sweet-Spots für Miles & More QP: {sweet_spots_str}).{central_asia_hint}
 3. STARTFLUGHAFEN, ZWISCHENSTOPPS & PRIORISIERUNG (KEIN ORIGIN-HIJACKING):
    - 'iata_origin' MUSS zwingend ein Flughafen sein, der im Artikel oder Buchungslink EXPLIZIT als buchbarer Abflugort für diesen Tarif genannt ist!
    - Wenn ein Deal NUR ab Warschau (WAW) oder Oslo (OSL) angeboten wird, MUSS iata_origin 'WAW' bzw. 'OSL' sein.
@@ -1427,8 +1467,8 @@ STRIKTE REGELN FÜR 'is_relevant = True':
    - Auch wenn das Drehkreuz im Text nicht ausdrücklich ausgeschrieben wird, die Hauptairline aber keinen Nonstop-Flug von iata_origin nach iata_destination durchführt, MUSS das erforderliche Drehkreuz der Airline in 'iata_via' stehen!
    - Bei 1-Stopp-Verbindungen mit wahlweisem Hub (z.B. Lufthansa via Frankfurt oder München) schreibe ['FRA/MUC'] als EIN Element (nur bei zwei echten Stopps hintereinander zwei Elemente wie ['FRA', 'SIN']). Bei echten Nonstop-Flügen: [].
 4. Preis (Fremdwährungen wie USD, CHF, GBP, PLN, SEK, DKK zwingend in EUR umrechnen!):
-   - Ab {hubs_str}: max. {price_hubs} EUR Return (Ideal < {price_ideal} EUR).
-   - Ab Ex-EU (z.B. WAW, OSL, ARN, DUB, MXP, AMS, BUD): max. {price_ex_eu} EUR Return (bis {price_top_cabin} EUR nur bei Top-Kabinen wie Etihad A350/787 oder Qatar Qsuite).
+   - Ab {hubs_str}: max. {price_hubs} EUR Return (jeder Preis <= {price_hubs} EUR ist preislich erlaubt).
+   - Ab Ex-EU (z.B. WAW, OSL, ARN, TLL, PRG, DUB, MXP, AMS, BUD): max. {price_ex_eu} EUR Return (bis {price_top_cabin} EUR bei Top-Kabinen wie Qatar Qsuite, Etihad A350/787 oder Turkish Airlines A350/787).
 5. Miles & More Punkte-Logik (Stand Oktober 2026 | FTL-Statusziel: 650 Points, davon mind. 325 QP):
    - Vollintegriert (Points UND QP): LH (Lufthansa), VL (City Airlines), LX (SWISS), OS (Austrian Airlines), SN (Brussels Airlines), EW (Eurowings), 4Y (Discover Airlines), EN (Air Dolomiti), LO (LOT Polish Airlines), AZ (ITA Airways), LG (Luxair), OU (Croatia Airlines).
      -> KRITISCH LOT POLISH AIRLINES (LO): LOT ist ein VOLLINTEGRIERTER Miles & More Partner!
@@ -1437,6 +1477,7 @@ STRIKTE REGELN FÜR 'is_relevant = True':
      -> Kontinental Business = 40 Points + 40 QP pro Segment. Interkontinental Business = 200 Points + 200 QP pro Segment (First = 400).
      -> Beispiel LOT Return ab Deutschland/Europa via Warschau (z.B. FRA-WAW-NRT-WAW-FRA): 2x Zubringer (2x40) + 2x Langstrecke (2x200) = 480 Points und 480 QP!
      -> Beispiel LOT Return Direktflug ab Warschau (WAW-NRT-WAW): 2x Langstrecke (2x200) = 400 Points und 400 QP!
+   - KRITISCH Zentralasien: Kasachstan (ALA/NQZ/TSE), Usbekistan (TAS/SKD), Kirgisistan (FRU), Tadschikistan (DYU) zählen bei Miles & More als INTERKONTINENTAL (200 Points pro Segment ab Europa/IST; bei LH/LO zusätzlich 200 QP pro Segment!). Kaukasus (TBS/EVN/GYD) zählt hingegen als kontinental (40 Points).
    - KRITISCH Nordafrika: Ägypten (CAI/HRG), Marokko (CMN/RAK), Tunesien (TUN), Algerien (ALG) zählen als KONTINENTAL (nur 40 Points/QP pro Segment, niemals 200!).
    - KRITISCH Edelweiss (WK): Gibt 0 Points/0 QP unter WK-Flugnummer! Nur unter LX-Codeshare (LX8000-8499) gibt es Punkte/QP.
    - KRITISCH Asiana (OZ): Seit 15.10.2026 ausgeschieden -> 0 Points / 0 QP!
@@ -1761,7 +1802,6 @@ def main():
     signal.signal(signal.SIGTERM, handle_shutdown_signal)
 
     validate_startup()
-    conn = init_db()
     client = create_genai_client()
 
     # Initialer Heartbeat & Start des Hintergrund-Watchdogs zur Selbstheilung bei Blockaden
@@ -1772,10 +1812,6 @@ def main():
         stop_event=STOP_EVENT,
     ).start()
 
-    c = conn.cursor()
-    c.execute("SELECT COUNT(*) FROM seen_urls")
-    is_new_db = c.fetchone()[0] == 0
-
     seed_mode = (
         os.environ.get("INITIAL_SEED_MODE", CONFIG.get("system", {}).get("initial_seed_mode", "eval_recent"))
         .strip()
@@ -1785,165 +1821,180 @@ def main():
         os.environ.get("INITIAL_SEED_MAX_DEALS", CONFIG.get("system", {}).get("initial_seed_max_deals", 5))
     )
 
-    if is_new_db:
-        logging.info(
-            f"Datenbank ist neu. Initialer Startmodus: '{seed_mode}' "
-            f"(Max. {seed_max_deals} Deals werden bewertet, Rest wird als gesehen markiert)..."
-        )
+    is_new_db = False
+    first_cycle = True
 
     while not STOP_EVENT.is_set():
         watchdog.beat(update_file=True)
-        cleanup_db(conn)
+        conn = init_db()
+        c = conn.cursor()
+        try:
+            if first_cycle:
+                c.execute("SELECT COUNT(*) FROM seen_urls")
+                is_new_db = c.fetchone()[0] == 0
+                if is_new_db:
+                    logging.info(
+                        f"Datenbank ist neu. Initialer Startmodus: '{seed_mode}' "
+                        f"(Max. {seed_max_deals} Deals werden bewertet, Rest wird als gesehen markiert)..."
+                    )
+                first_cycle = False
 
-        # 1. Paralleler Abruf aller Feeds in einer einzigen Welle (max_workers = len(RSS_FEEDS))
-        feeds_entries = fetch_all_feeds(RSS_FEEDS, max_workers=len(RSS_FEEDS))
-        watchdog.beat(update_file=True)
+            cleanup_db(conn)
 
-        # 2. Round-Robin Interleaving: Reihum 1 Eintrag aus jedem Feed
-        interleaved_entries = []
-        max_entries = max((len(entries) for _, entries in feeds_entries), default=0)
-        for idx in range(max_entries):
-            for feed_url, entries in feeds_entries:
-                if idx < len(entries):
-                    interleaved_entries.append((entries[idx], feed_url))
-
-        evaluated_seed_deals = 0
-        consecutive_eval_failures = 0
-        circuit_breaker_tripped = False
-
-        # 3. Durchlaufe die ausgewogenen Einträge
-        for entry, feed_url in interleaved_entries:
-            if STOP_EVENT.is_set():
-                logging.info("Stopp-Signal erhalten. Breche aktuellen Verarbeitungszyklus ab.")
-                break
-
+            # 1. Paralleler Abruf aller Feeds in einer einzigen Welle (max_workers = len(RSS_FEEDS))
+            feeds_entries = fetch_all_feeds(RSS_FEEDS, max_workers=len(RSS_FEEDS))
             watchdog.beat(update_file=True)
 
-            try:
-                raw_link = entry.get("link", "")
-                if not raw_link:
-                    continue
-                clean_link = normalize_url(raw_link)
-                c.execute("SELECT 1 FROM seen_urls WHERE url_clean = ?", (clean_link,))
-                if c.fetchone():
-                    continue
+            # 2. Round-Robin Interleaving: Reihum 1 Eintrag aus jedem Feed
+            interleaved_entries = []
+            max_entries = max((len(entries) for _, entries in feeds_entries), default=0)
+            for idx in range(max_entries):
+                for feed_url, entries in feeds_entries:
+                    if idx < len(entries):
+                        interleaved_entries.append((entries[idx], feed_url))
 
-                title = entry.get("title", "")
-                content_list = entry.get("content")
-                raw_content = (content_list[0].get("value") if content_list else None) or entry.get("summary") or title
+            evaluated_seed_deals = 0
+            consecutive_eval_failures = 0
+            circuit_breaker_tripped = False
 
-                # 1. Deterministischer Pre-Filter (Negativ-Keywords & Positiv-Gate für gemischte Feeds)
-                is_eligible, pre_reason = is_feed_entry_eligible_pre_filter(title, raw_content, feed_url)
-                if not is_eligible:
-                    logging.info(f"Eintrag im Pre-Filter verworfen ({pre_reason}): {title}")
-                    c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                    conn.commit()
-                    continue
+            # 3. Durchlaufe die ausgewogenen Einträge
+            for entry, feed_url in interleaved_entries:
+                if STOP_EVENT.is_set():
+                    logging.info("Stopp-Signal erhalten. Breche aktuellen Verarbeitungszyklus ab.")
+                    break
 
-                # Airline-Ignorier-Filter (Pre-Filter auf Titelebene)
-                is_ignored_title, matched_air = is_airline_ignored_in_text(title, IGNORED_AIRLINES)
-                if is_ignored_title:
-                    logging.info(f"Eintrag vorab ignoriert (Airline im Titel: '{matched_air}'): {title}")
-                    c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                    conn.commit()
-                    continue
-
-                # Initial Seeding Logik:
-                if is_new_db:
-                    if seed_mode == "silent":
-                        # Stummer Modus: Alle Deals still schlucken
-                        c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                        conn.commit()
-                        continue
-                    elif seed_mode == "eval_recent":
-                        # Bewertet nur die ersten seed_max_deals Deals, restliche alte Einträge überspringen
-                        if evaluated_seed_deals >= seed_max_deals:
-                            c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                            conn.commit()
-                            continue
-
-                full_text, sample_booking = get_enriched_deal_context(raw_content, raw_link)
                 watchdog.beat(update_file=True)
 
                 try:
-                    deal = evaluate_with_gemini(client, title, full_text)
-                    consecutive_eval_failures = 0
-                except Exception as gemini_err:
-                    consecutive_eval_failures += 1
+                    raw_link = entry.get("link", "")
+                    if not raw_link:
+                        continue
+                    clean_link = normalize_url(raw_link)
+                    c.execute("SELECT 1 FROM seen_urls WHERE url_clean = ?", (clean_link,))
+                    if c.fetchone():
+                        continue
+
+                    title = entry.get("title", "")
+                    content_list = entry.get("content")
+                    raw_content = (
+                        (content_list[0].get("value") if content_list else None) or entry.get("summary") or title
+                    )
+
+                    # 1. Deterministischer Pre-Filter (Negativ-Keywords & Positiv-Gate für gemischte Feeds)
+                    is_eligible, pre_reason = is_feed_entry_eligible_pre_filter(title, raw_content, feed_url)
+                    if not is_eligible:
+                        logging.info(f"Eintrag im Pre-Filter verworfen ({pre_reason}): {title}")
+                        c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
+                        conn.commit()
+                        continue
+
+                    # Airline-Ignorier-Filter (Pre-Filter auf Titelebene)
+                    is_ignored_title, matched_air = is_airline_ignored_in_text(title, IGNORED_AIRLINES)
+                    if is_ignored_title:
+                        logging.info(f"Eintrag vorab ignoriert (Airline im Titel: '{matched_air}'): {title}")
+                        c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
+                        conn.commit()
+                        continue
+
+                    # Initial Seeding Logik:
+                    if is_new_db:
+                        if seed_mode == "silent":
+                            # Stummer Modus: Alle Deals still schlucken
+                            c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
+                            conn.commit()
+                            continue
+                        elif seed_mode == "eval_recent":
+                            # Bewertet nur die ersten seed_max_deals Deals, restliche alte Einträge überspringen
+                            if evaluated_seed_deals >= seed_max_deals:
+                                c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
+                                conn.commit()
+                                continue
+
+                    full_text, sample_booking = get_enriched_deal_context(raw_content, raw_link)
                     watchdog.beat(update_file=True)
-                    logging.error(
-                        "KI-Auswertung fehlgeschlagen (%d/%d in Folge) für %s: %s",
-                        consecutive_eval_failures,
-                        GEMINI_CIRCUIT_BREAKER_THRESHOLD,
-                        entry.get("link", "unbekannt"),
-                        gemini_err,
-                    )
-                    if should_trip_circuit_breaker(consecutive_eval_failures):
-                        circuit_breaker_tripped = True
-                        logging.warning(
-                            "Circuit-Breaker ausgelöst nach %d fehlgeschlagenen KI-Auswertungen in Folge. "
-                            "Pausiere restliche Einträge bis zum nächsten Zyklus in %ds...",
+
+                    try:
+                        deal = evaluate_with_gemini(client, title, full_text)
+                        consecutive_eval_failures = 0
+                    except Exception as gemini_err:
+                        consecutive_eval_failures += 1
+                        watchdog.beat(update_file=True)
+                        logging.error(
+                            "KI-Auswertung fehlgeschlagen (%d/%d in Folge) für %s: %s",
                             consecutive_eval_failures,
-                            CHECK_INTERVAL,
+                            GEMINI_CIRCUIT_BREAKER_THRESHOLD,
+                            entry.get("link", "unbekannt"),
+                            gemini_err,
                         )
-                        break
-                    continue
-
-                watchdog.beat(update_file=True)
-
-                # 2. Deterministischer Post-Validation Airbag
-                is_safe, safety_veto_reason = validate_deal_safety(deal, title, full_text)
-                if not is_safe:
-                    logging.warning(
-                        f"Sicherheits-Veto für {format_deal_route_plain(deal)} ({deal.price_eur}€): {safety_veto_reason}"
-                    )
-                    deal.is_relevant = False
-                    deal.deal_category = "Irrelevant"
-                    deal.rejection_reason = safety_veto_reason
-
-                if is_new_db and seed_mode == "eval_recent":
-                    evaluated_seed_deals += 1
-
-                if deal.is_relevant and deal.deal_category != "Irrelevant":
-                    # Intelligenter Duplikat- und Preissturz-Check
-                    should_send, send_reason, prev_price = should_send_deal(conn, deal, min_price_drop=75)
-                    fingerprint = build_deal_fingerprint(deal)
-
-                    if should_send:
-                        send_telegram(deal, title, raw_link, sample_booking, prev_price=prev_price)
-                        record_sent_deal(conn, deal)
-                        if send_reason == "price_drop":
-                            logging.info(
-                                f"Deal-Preisupdate gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
+                        if should_trip_circuit_breaker(consecutive_eval_failures):
+                            circuit_breaker_tripped = True
+                            logging.warning(
+                                "Circuit-Breaker ausgelöst nach %d fehlgeschlagenen KI-Auswertungen in Folge. "
+                                "Pausiere restliche Einträge bis zum nächsten Zyklus in %ds...",
+                                consecutive_eval_failures,
+                                CHECK_INTERVAL,
                             )
+                            break
+                        continue
+
+                    watchdog.beat(update_file=True)
+
+                    # 2. Deterministischer Post-Validation Airbag
+                    is_safe, safety_veto_reason = validate_deal_safety(deal, title, full_text)
+                    if not is_safe:
+                        logging.warning(
+                            f"Sicherheits-Veto für {format_deal_route_plain(deal)} ({deal.price_eur}€): {safety_veto_reason}"
+                        )
+                        deal.is_relevant = False
+                        deal.deal_category = "Irrelevant"
+                        deal.rejection_reason = safety_veto_reason
+
+                    if is_new_db and seed_mode == "eval_recent":
+                        evaluated_seed_deals += 1
+
+                    if deal.is_relevant and deal.deal_category != "Irrelevant":
+                        # Intelligenter Duplikat- und Preissturz-Check
+                        should_send, send_reason, prev_price = should_send_deal(conn, deal, min_price_drop=75)
+                        fingerprint = build_deal_fingerprint(deal)
+
+                        if should_send:
+                            send_telegram(deal, title, raw_link, sample_booking, prev_price=prev_price)
+                            record_sent_deal(conn, deal)
+                            if send_reason == "price_drop":
+                                logging.info(
+                                    f"Deal-Preisupdate gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
+                                )
+                            else:
+                                logging.info(
+                                    f"Neuer Deal gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€, {deal.airline_names})"
+                                )
+                            time.sleep(2)
                         else:
                             logging.info(
-                                f"Neuer Deal gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€, {deal.airline_names})"
+                                f"Cross-Feed-Duplikat unterdrückt: {fingerprint} ({deal.price_eur}€, bestehend: {prev_price}€)"
                             )
-                        time.sleep(2)
                     else:
-                        logging.info(
-                            f"Cross-Feed-Duplikat unterdrückt: {fingerprint} ({deal.price_eur}€, bestehend: {prev_price}€)"
+                        reason = (
+                            deal.rejection_reason
+                            if getattr(deal, "rejection_reason", None)
+                            else f"Kategorie: {deal.deal_category}"
                         )
-                else:
-                    reason = (
-                        deal.rejection_reason
-                        if getattr(deal, "rejection_reason", None)
-                        else f"Kategorie: {deal.deal_category}"
-                    )
-                    logging.info(
-                        f"Deal verworfen ({format_deal_route_plain(deal)}, {deal.price_eur}€, {deal.airline_names}): {reason}"
-                    )
+                        logging.info(
+                            f"Deal verworfen ({format_deal_route_plain(deal)}, {deal.price_eur}€, {deal.airline_names}): {reason}"
+                        )
 
-                # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL als gesehen speichern
-                c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                conn.commit()
-            except Exception as entry_err:
-                logging.error(f"Fehler bei Eintrag {entry.get('link', 'unbekannt')}: {entry_err}")
+                    # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL als gesehen speichern
+                    c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
+                    conn.commit()
+                except Exception as entry_err:
+                    logging.error(f"Fehler bei Eintrag {entry.get('link', 'unbekannt')}: {entry_err}")
 
-        if is_new_db and not circuit_breaker_tripped:
-            logging.info("Initialer Start-Zyklus erfolgreich abgeschlossen. Live-Überwachung aktiv.")
-            is_new_db = False
+            if is_new_db and not circuit_breaker_tripped:
+                logging.info("Initialer Start-Zyklus erfolgreich abgeschlossen. Live-Überwachung aktiv.")
+                is_new_db = False
+        finally:
+            c.close()
+            close_db(conn)
 
         # Heartbeat nach jedem Zyklus aktualisieren
         watchdog.beat(update_file=True)
@@ -1960,7 +2011,6 @@ def main():
             logging.info("Bot wurde gestoppt. Fahre geordnet herunter.")
             break
 
-    conn.close()
     SESSION.close()
 
 
