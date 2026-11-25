@@ -4,7 +4,6 @@ import time
 
 import feedparser
 import requests
-from google import genai
 
 from bot import (
     GEMINI_API_KEY,
@@ -14,7 +13,9 @@ from bot import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     clean_html,
+    create_genai_client,
     evaluate_with_gemini,
+    format_deal_route_plain,
     init_db,
     is_airline_ignored_in_text,
     is_feed_entry_eligible_pre_filter,
@@ -37,7 +38,7 @@ def main():
 
     conn = init_db()
     c = conn.cursor()
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = create_genai_client()
 
     evaluated_count = 0
     relevant_pushed = 0
@@ -109,7 +110,7 @@ def main():
                 print(f"   -> Relevant: {deal.is_relevant}")
                 print(f"   -> Kategorie: {deal.deal_category}")
                 print(f"   -> Airline: {deal.airline_names}")
-                print(f"   -> Route: {deal.iata_origin} -> {deal.iata_destination} (Gabelflug: {deal.is_open_jaw})")
+                print(f"   -> Route: {format_deal_route_plain(deal)} (Gabelflug: {deal.is_open_jaw})")
                 print(f"   -> Preis: {deal.price_eur} € (Klasse: {deal.booking_class})")
                 print(f"   -> M&M Points: {deal.mm_points} | QP: {deal.mm_qualifying_points}")
                 print(f"   -> Bordprodukt: {deal.cabin_assessment}")

@@ -1,6 +1,6 @@
 services:
   flight-deal-bot:
-    build: .
+    image: ghcr.io/fxhuhn/flight-news:main
     container_name: flight-deal-bot
     restart: unless-stopped
     env_file:

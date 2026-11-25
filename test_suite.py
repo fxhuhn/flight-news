@@ -32,8 +32,10 @@ from bot import (
     is_airline_ignored_in_text,
     is_deal_ignored_airline,
     is_feed_entry_eligible_pre_filter,
+    normalize_iata_via,
     normalize_url,
     record_sent_deal,
+    resolve_deal_stops,
     should_send_deal,
     validate_deal_safety,
 )
@@ -672,6 +674,24 @@ def test_12_telegram_formatting_and_redundancy_defense():
     msg_boiler = build_telegram_message(deal_boilerplate, "Prague -> Beijing", "https://example.com/deal")
     passed_no_boiler = ("Besonderheiten:" not in msg_boiler) and ("Preis-Check" not in msg_boiler)
 
+    # 5. Fall: Erforderlicher Zwischenstopp (z.B. Finnair AMS -> HEL -> BKK) wird in der Route angezeigt
+    deal_ay = deal_base.model_copy(
+        update={
+            "airline_names": "Finnair (AY)",
+            "primary_airline_iata": "AY",
+            "iata_origin": "AMS",
+            "iata_via": [],
+            "iata_destination": "BKK",
+            "routing_advice": "Auch ab Tallinn (TLL) buchbar, Stopover in Helsinki (HEL) möglich.",
+        }
+    )
+    msg_ay = build_telegram_message(deal_ay, "European Cities -> Bangkok", "https://example.com/ay")
+    passed_stop_hel = (
+        "• <b>Route:</b> <code>AMS</code> ➔ <code>HEL</code> ➔ <code>BKK</code> (Finnair (AY))" in msg_ay
+        and resolve_deal_stops(deal_ay) == ["HEL"]
+        and normalize_iata_via(["Helsinki (HEL)"], "AMS", "BKK") == ["HEL"]
+    )
+
     all_passed = (
         passed_no_red
         and passed_no_preis_check
@@ -679,8 +699,9 @@ def test_12_telegram_formatting_and_redundancy_defense():
         and passed_empty
         and passed_feat
         and passed_no_boiler
+        and passed_stop_hel
     )
-    details = f"RedundantFiltered={passed_no_red}, NoPreisCheck={passed_no_preis_check}, CategoryGap={passed_category_gap}, CleanEmpty={passed_empty}, FeatureShown={passed_feat}, BoilerplateFiltered={passed_no_boiler}"
+    details = f"RedundantFiltered={passed_no_red}, NoPreisCheck={passed_no_preis_check}, CategoryGap={passed_category_gap}, CleanEmpty={passed_empty}, FeatureShown={passed_feat}, BoilerplateFiltered={passed_no_boiler}, StopHEL={passed_stop_hel}"
     record_result(
         "Test 12: Telegram Formatting & Redundancy Defense (No-Boilerplate, Spacing, Filter)", all_passed, details
     )

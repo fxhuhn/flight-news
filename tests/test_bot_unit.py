@@ -1,22 +1,36 @@
 import os
 import tempfile
+import threading
+import time
+from unittest.mock import MagicMock, patch
+
+import requests
+from google.genai import types
 
 from bot import (
     IGNORED_AIRLINES,
+    ActivityWatchdog,
     FlightDealEvaluation,
     build_gf_main_url,
     build_positioning_url,
     build_telegram_message,
     clean_html,
+    create_genai_client,
+    format_deal_route_plain,
+    generate_with_gemini_fallback,
     init_db,
     is_airline_ignored_in_text,
     is_deal_ignored_airline,
     is_feed_entry_eligible_pre_filter,
     normalize_and_verify_deal_mm_points,
+    normalize_iata_via,
     normalize_url,
     record_sent_deal,
+    resolve_deal_stops,
     should_send_deal,
+    should_trip_circuit_breaker,
     validate_deal_safety,
+    wait_for_next_cycle,
 )
 
 
@@ -352,6 +366,86 @@ def test_telegram_formatting_and_redundancy_defense():
     assert "Stopover in AUH kostenlos" in msg_feat
 
 
+def test_required_intermediate_stops_in_telegram_message():
+    from google.genai import _transformers
+
+    # 1. Gemini Schema-Check: 'iata_via' muss im generierten Schema als Pflichtfeld (required) markiert sein
+    schema = _transformers.t_schema(None, FlightDealEvaluation)
+    assert "iata_via" in (schema.required or [])
+
+    # 2. Exaktes Nutzerbeispiel: Finnair AMS -> BKK (muss HEL als Zwischenstopp in der Route zeigen,
+    #    sowohl bei explizitem iata_via=['HEL'] als auch per deterministischem Hub-Fallback bei iata_via=[])
+    deal_finnair = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="European Cities -> Bangkok Business Class Round Trip from 1785€",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
+        airline_names="Finnair (AY)",
+        primary_airline_iata="AY",
+        iata_origin="AMS",
+        iata_via=[],
+        iata_destination="BKK",
+        is_open_jaw=False,
+        iata_return_end="AMS",
+        region="Asien",
+        sample_outbound_date="2027-01-15",
+        sample_return_date="2027-01-29",
+        price_eur=1785,
+        booking_class="Nicht genannt",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="AirLounge seat",
+        routing_advice="Auch ab Tallinn (TLL) sowie weiteren europäischen Städten buchbar, Stopover in Helsinki (HEL) möglich.",
+        rejection_reason="",
+    )
+    assert resolve_deal_stops(deal_finnair) == ["HEL"]
+    assert format_deal_route_plain(deal_finnair) == "AMS->HEL->BKK"
+    msg_ay = build_telegram_message(
+        deal_finnair,
+        "European Cities → Bangkok Business Class Round Trip from 1785€",
+        "https://premium-flights.com/business-class-european-cities-to-bangkok/",
+    )
+    assert "• <b>Route:</b> <code>AMS</code> ➔ <code>HEL</code> ➔ <code>BKK</code> (Finnair (AY))" in msg_ay
+    assert "TLL" not in resolve_deal_stops(deal_finnair)
+
+    # 3. Echter Nonstop-Flug ab Hub (z.B. HEL -> BKK mit Finnair) darf KEINEN doppelten Stopp zeigen
+    deal_ay_nonstop = deal_finnair.model_copy(
+        update={"iata_origin": "HEL", "iata_return_end": "HEL", "routing_advice": ""}
+    )
+    assert resolve_deal_stops(deal_ay_nonstop) == []
+    msg_ay_nonstop = build_telegram_message(deal_ay_nonstop, "Helsinki -> Bangkok", "https://example.com/ay")
+    assert "• <b>Route:</b> <code>HEL</code> ➔ <code>BKK</code> (Finnair (AY))" in msg_ay_nonstop
+
+    # 4. Sanitizer für unsaubere Modell-Outputs (Klammernotation, Origin/Dest-Wiederholung, Direktflug-Marker)
+    assert normalize_iata_via(["Helsinki (HEL)"], "AMS", "BKK") == ["HEL"]
+    assert normalize_iata_via(["AMS", "HEL", "BKK"], "AMS", "BKK") == ["HEL"]
+    assert normalize_iata_via(["FRA / MUC"], "HAM", "BKK") == ["FRA/MUC"]
+    assert normalize_iata_via(["Direktflug", "Nonstop"], "FRA", "BKK") == []
+
+    # 5. Mehrere Stopps & Open-Jaw (inkl. Gabelflug zurück zum Hub wie AMS -> HEL -> BKK -> HEL)
+    deal_multi_oj = deal_finnair.model_copy(update={"iata_via": ["HEL"], "is_open_jaw": True, "iata_return_end": "HEL"})
+    msg_oj = build_telegram_message(deal_multi_oj, "Open Jaw Deal", "https://example.com/oj")
+    assert (
+        "• <b>Route:</b> <code>AMS</code> ➔ <code>HEL</code> ➔ <code>BKK</code> ➔ <code>HEL</code> (Gabelflug) (Finnair (AY))"
+        in msg_oj
+    )
+
+    # 6. Multi-Hub-Airline (Lufthansa): Nonstop ab FRA bleibt ohne Stopp, ab HAM Fallback auf FRA/MUC bzw. expliziter Hub
+    deal_lh_fra = deal_finnair.model_copy(
+        update={
+            "airline_names": "Lufthansa (LH)",
+            "primary_airline_iata": "LH",
+            "iata_origin": "FRA",
+            "iata_return_end": "FRA",
+            "routing_advice": "",
+        }
+    )
+    assert resolve_deal_stops(deal_lh_fra) == []
+
+    deal_lh_ham = deal_lh_fra.model_copy(update={"iata_origin": "HAM", "iata_return_end": "HAM"})
+    assert resolve_deal_stops(deal_lh_ham) == ["FRA/MUC"]
+
+
 def test_miles_and_more_lot_and_partner_qp():
     base_deal = FlightDealEvaluation(
         detected_cabin_class="Business Class",
@@ -407,3 +501,98 @@ def test_miles_and_more_lot_and_partner_qp():
     deal_tk_fixed = normalize_and_verify_deal_mm_points(deal_tk)
     assert deal_tk_fixed.mm_qualifying_points == 0
     assert deal_tk_fixed.deal_category == "Star Alliance (Nur Points)"
+
+
+def test_genai_client_timeout_and_fallback_resilience():
+    # 1. Prüfe, dass create_genai_client das Millisekunden-Timeout korrekt in Sekunden (45.0s) im SDK verankert
+    client = create_genai_client(api_key="test-dummy-key", timeout_ms=45_000)
+    req = client._api_client._build_request("post", "models/gemini-3.8-flash:generateContent", {"contents": []})
+    assert req.timeout == 45.0
+
+    # 2. Prüfe, dass GenerateContentConfig die übergebenen Parameter (http_options + AFC-Deaktivierung) akzeptiert
+    captured_configs: list[dict] = []
+    mock_client = MagicMock()
+
+    def side_effect(model, contents, config):
+        # Validiere gegen das echte google-genai Pydantic-Schema
+        validated = types.GenerateContentConfig.model_validate(config)
+        assert validated.automatic_function_calling.disable is True
+        assert validated.http_options.timeout == 30_000
+        captured_configs.append((model, config))
+        if len(captured_configs) == 1:
+            raise requests.exceptions.ReadTimeout("HTTPSConnectionPool: Read timed out. (read timeout=30.0)")
+        if len(captured_configs) == 2:
+            raise requests.exceptions.ConnectionError("RemoteDisconnected('Remote end closed connection')")
+        mock_resp = MagicMock()
+        mock_resp.text = "ok"
+        return mock_resp
+
+    mock_client.models.generate_content.side_effect = side_effect
+
+    with patch("bot.time.sleep"):
+        resp = generate_with_gemini_fallback(
+            client=mock_client,
+            prompt="Test Prompt",
+            response_schema=FlightDealEvaluation,
+            preferred_model="gemini-3.8-flash",
+            http_timeout_ms=30_000,
+        )
+
+    assert resp.text == "ok"
+    assert len(captured_configs) == 3
+    # Sicherstellen, dass bei Timeout/ConnectionError jeweils auf das nächste Modell weitergeschaltet wurde
+    assert captured_configs[0][0] == "gemini-3.8-flash"
+    assert captured_configs[1][0] == "gemini-flash-latest"
+    assert captured_configs[2][0] == "gemini-3.5-flash"
+
+
+def test_circuit_breaker_threshold():
+    assert should_trip_circuit_breaker(0, threshold=3) is False
+    assert should_trip_circuit_breaker(2, threshold=3) is False
+    assert should_trip_circuit_breaker(3, threshold=3) is True
+    assert should_trip_circuit_breaker(5, threshold=3) is True
+    assert should_trip_circuit_breaker(5, threshold=0) is False
+
+
+def test_activity_watchdog_and_cycle_wait():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        hb_path = os.path.join(tmpdir, "heartbeat")
+        stop_evt = threading.Event()
+        exit_codes: list[int] = []
+        triggered_evt = threading.Event()
+
+        def fake_exit(code: int) -> None:
+            exit_codes.append(code)
+            triggered_evt.set()
+
+        wd = ActivityWatchdog(
+            max_inactivity_seconds=1,
+            check_interval_seconds=0.05,
+            heartbeat_file=hb_path,
+            stop_event=stop_evt,
+            exit_fn=fake_exit,
+        )
+        wd.beat(update_file=True)
+        assert os.path.exists(hb_path)
+        assert wd.check_once() is False
+        assert exit_codes == []
+
+        # Starte Hintergrund-Thread: ohne neuen Beat muss nach >1s der Selbstheilungs-Exit ausgelöst werden
+        wd.start()
+        assert triggered_evt.wait(timeout=2.5) is True
+        stop_evt.set()
+        assert exit_codes == [1]
+
+        # Prüfe unterbrechbares Warten zwischen Zyklen
+        cycle_stop = threading.Event()
+        wd_active = ActivityWatchdog(
+            max_inactivity_seconds=60,
+            heartbeat_file=hb_path,
+            stop_event=cycle_stop,
+            exit_fn=fake_exit,
+        )
+        threading.Timer(0.1, cycle_stop.set).start()
+        t0 = time.monotonic()
+        interrupted = wait_for_next_cycle(30, stop_event=cycle_stop, watchdog=wd_active, heartbeat_interval=1)
+        assert interrupted is True
+        assert (time.monotonic() - t0) < 2.0

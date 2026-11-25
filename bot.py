@@ -17,7 +17,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 import urllib.parse
-from typing import Any, Literal, Type
+from typing import Any, Callable, Literal, Type
 
 import feedparser
 import requests
@@ -27,7 +27,7 @@ from fast_flights import FlightQuery, Passengers, create_query
 from fast_flights.pb import flights_pb2
 from google import genai
 from google.genai import errors
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -42,9 +42,12 @@ if _env_file.exists():
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_HTTP_TIMEOUT_MS = int(os.environ.get("GEMINI_HTTP_TIMEOUT_MS", "45000"))
+GEMINI_CIRCUIT_BREAKER_THRESHOLD = int(os.environ.get("GEMINI_CIRCUIT_BREAKER_THRESHOLD", "3"))
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip() or os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "1800"))
+WATCHDOG_TIMEOUT_SECONDS = int(os.environ.get("WATCHDOG_TIMEOUT_SECONDS", "2100"))
 DB_PATH = os.environ.get("DB_PATH")
 if not DB_PATH:
     DB_PATH = (
@@ -56,6 +59,114 @@ HEARTBEAT_FILE = os.environ.get("HEARTBEAT_FILE", "/tmp/heartbeat")  # nosec B10
 CONFIG_PATH = Path(os.environ.get("CONFIG_PATH", Path(__file__).resolve().parent / "config.toml"))
 
 STOP_EVENT = threading.Event()
+
+
+def touch_heartbeat(heartbeat_path: str = HEARTBEAT_FILE) -> None:
+    """Aktualisiert die Heartbeat-Datei fehlertolerant für den Docker-Healthcheck."""
+    try:
+        p = Path(heartbeat_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.touch()
+    except OSError as exc:
+        logging.warning(f"Konnte Heartbeat-Datei {heartbeat_path} nicht aktualisieren: {exc}")
+
+
+class ActivityWatchdog:
+    """
+    Hintergrund-Watchdog zur Selbstheilung bei eingefrorenen Netzwerk-/Socket-Operationen.
+    Prüft periodisch den Zeitstempel der letzten Aktivität und beendet den Prozess hart per
+    os._exit(1), falls die Hauptschleife länger als max_inactivity_seconds blockiert ist,
+    damit Docker (restart: unless-stopped) den Container automatisch neu startet.
+    """
+
+    def __init__(
+        self,
+        max_inactivity_seconds: int = WATCHDOG_TIMEOUT_SECONDS,
+        check_interval_seconds: float = 60.0,
+        heartbeat_file: str = HEARTBEAT_FILE,
+        stop_event: threading.Event | None = None,
+        exit_fn: Callable[[int], None] = os._exit,
+    ) -> None:
+        self.max_inactivity_seconds = max(1, int(max_inactivity_seconds))
+        self.check_interval_seconds = max(0.05, float(check_interval_seconds))
+        self.heartbeat_file = heartbeat_file
+        self._stop_event = stop_event or threading.Event()
+        self._exit_fn = exit_fn
+        self._lock = threading.Lock()
+        self._last_activity = time.monotonic()
+        self._thread: threading.Thread | None = None
+
+    def beat(self, update_file: bool = True) -> None:
+        """Meldet Fortschritt an den Watchdog und aktualisiert optional die Heartbeat-Datei."""
+        with self._lock:
+            self._last_activity = time.monotonic()
+        if update_file and self.heartbeat_file:
+            touch_heartbeat(self.heartbeat_file)
+
+    def seconds_since_last_activity(self) -> float:
+        with self._lock:
+            return time.monotonic() - self._last_activity
+
+    def check_once(self) -> bool:
+        """Prüft einmalig auf Überschreitung des Inaktivitätslimits. Gibt True bei Auslösung zurück."""
+        idle_seconds = self.seconds_since_last_activity()
+        if idle_seconds > self.max_inactivity_seconds:
+            logging.critical(
+                "WATCHDOG-ALARM: Keine Aktivität seit %.1fs (Limit: %ds). "
+                "Erzwinge Prozess-Exit zur automatischen Container-Selbstheilung...",
+                idle_seconds,
+                self.max_inactivity_seconds,
+            )
+            self._exit_fn(1)
+            return True
+        return False
+
+    def _run(self) -> None:
+        while not self._stop_event.wait(timeout=self.check_interval_seconds):
+            if self.check_once():
+                break
+
+    def start(self) -> "ActivityWatchdog":
+        self.beat(update_file=True)
+        self._thread = threading.Thread(target=self._run, name="activity-watchdog", daemon=True)
+        self._thread.start()
+        return self
+
+
+def wait_for_next_cycle(
+    total_seconds: int,
+    stop_event: threading.Event = STOP_EVENT,
+    watchdog: ActivityWatchdog | None = None,
+    heartbeat_interval: int = 300,
+) -> bool:
+    """
+    Wartet unterbrechbar bis zum nächsten Zyklus und hält während der geplanten Ruhephase
+    den Watchdog sowie die Heartbeat-Datei frisch, damit auch lange Intervalle (> 45 Min.)
+    keinen falschen Healthcheck-Alarm auslösen. Gibt True zurück, wenn stop_event gesetzt wurde.
+    """
+    remaining = float(max(0, total_seconds))
+    step = float(max(1, min(heartbeat_interval, 60)))
+    elapsed_since_beat = 0.0
+
+    while remaining > 0:
+        chunk = min(step, remaining)
+        if stop_event.wait(timeout=chunk):
+            return True
+        remaining -= chunk
+        elapsed_since_beat += chunk
+        if watchdog and elapsed_since_beat >= heartbeat_interval:
+            watchdog.beat(update_file=True)
+            elapsed_since_beat = 0.0
+
+    return stop_event.is_set()
+
+
+def create_genai_client(
+    api_key: str = GEMINI_API_KEY,
+    timeout_ms: int = GEMINI_HTTP_TIMEOUT_MS,
+) -> genai.Client:
+    """Erstellt einen Gemini-Client mit striktem HTTP-Timeout (in Millisekunden) gegen Socket-Hangs."""
+    return genai.Client(api_key=api_key, http_options={"timeout": timeout_ms})
 
 
 def handle_shutdown_signal(signum: int, frame: Any):
@@ -276,7 +387,16 @@ def is_feed_entry_eligible_pre_filter(entry_title: str, entry_content: str, feed
     return True, ""
 
 
+def _make_iata_via_required(schema: dict[str, Any]) -> None:
+    """Stellt sicher, dass Gemini Structured Outputs das Feld 'iata_via' immer aktiv befüllt."""
+    req = schema.setdefault("required", [])
+    if isinstance(req, list) and "iata_via" not in req:
+        req.append("iata_via")
+
+
 class FlightDealEvaluation(BaseModel):
+    model_config = ConfigDict(json_schema_extra=_make_iata_via_required)
+
     detected_cabin_class: Literal[
         "Business Class", "First Class", "Economy / Premium Eco", "Unklar / Nicht genannt"
     ] = Field(
@@ -326,6 +446,20 @@ class FlightDealEvaluation(BaseModel):
             "der im Text gar nicht angeboten wird!"
         )
     )
+    iata_via: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Liste der 3-Letter IATA-Codes aller erforderlichen Zwischenstopps / Umsteigeflughäfen auf der Strecke "
+            "zwischen iata_origin und iata_destination in Flugrichtung (z.B. ['HEL'] bei Finnair AMS->HEL->BKK, "
+            "['DOH'] bei Qatar Airways, ['AUH'] bei Etihad, ['ZRH'] bei SWISS, ['WAW'] bei LOT ab Westeuropa, "
+            "['FRA', 'SIN'] bei zwei echten Umstiegen hintereinander, oder ['FRA/MUC'] bei 1 Umstieg wahlweise via FRA oder MUC). "
+            "WICHTIG: Auch wenn der Artikel das Drehkreuz nicht explizit ausschreibt, die Airline aber keinen Nonstop-Flug "
+            "zwischen iata_origin und iata_destination anbietet (z.B. Finnair ab AMS nach BKK geht zwingend über 'HEL'), "
+            "MUSS das erforderliche Drehkreuz angegeben werden! "
+            "Nur bei echtem Nonstop-/Direktflug (z.B. HEL->BKK mit Finnair oder FRA->BKK direkt mit Thai/Lufthansa): leere Liste []. "
+            "Niemals iata_origin oder iata_destination selbst wiederholen!"
+        ),
+    )
     iata_destination: str = Field(description="3-Letter IATA Code des Hauptziels (z.B. BKK, SIN, GRU)")
     is_open_jaw: bool = Field(description="True, falls Gabelflug (Rückflug endet an anderem Flughafen als iata_origin)")
     iata_return_end: str = Field(
@@ -360,8 +494,9 @@ class FlightDealEvaluation(BaseModel):
         description=(
             "NUR befüllen bei konkreten, im Text genannten operativen Besonderheiten: "
             "1. Weitere alternative Abflughäfen (z.B. 'Auch ab BUD, ARN, MXP buchbar'). "
-            "2. Ungewöhnliche Umstiege (z.B. '> 8h Nacht-Layover in DOH' oder 'Flughafenwechsel NRT->HND'). "
-            "3. Tarifregeln (z.B. 'Mindestaufenthalt 6 Tage', 'Stopover kostenlos'). "
+            "2. Ungewöhnliche Umstiege (z.B. '> 8h Nacht-Layover in DOH' oder 'Flughafenwechsel LHR->LGW'). "
+            "3. Tarifregeln (z.B. 'Mindestaufenthalt 6 Tage', 'Mehrtägiger Stopover in HEL kostenlos/möglich'). "
+            "HINWEIS: Reguläre erforderliche Zwischenstopps gehören als IATA-Code in 'iata_via' (nicht als bloßes 'Umstieg in X' wiederholen). "
             "STRENG VERBOTEN: Keine Wiederholung von Abflugort/Route, keine Meilen-/Allianzhinweise, "
             "keine pauschalen Positionierungs-Tipps (24h Puffer) und KEINE generischen Buchungstipps / "
             "Preis-Checks (z.B. OTA vs. Direktbuchung, Momondo/Kayak/Skyscanner, Zahlungsaufschläge, Phantom-Verfügbarkeit). "
@@ -481,6 +616,244 @@ def normalize_and_verify_deal_mm_points(deal: FlightDealEvaluation) -> FlightDea
                 deal.deal_category = "FTL-Booster (Points + QP)"
 
     return deal
+
+
+SINGLE_HUB_AIRLINES: dict[str, str] = {
+    "AY": "HEL",  # Finnair
+    "LX": "ZRH",  # SWISS (Interkontinental nach Asien/Südamerika/Nahost ausschließlich via ZRH)
+    "OS": "VIE",  # Austrian Airlines
+    "SN": "BRU",  # Brussels Airlines
+    "KL": "AMS",  # KLM
+    "AF": "CDG",  # Air France
+    "LO": "WAW",  # LOT Polish Airlines
+    "AZ": "FCO",  # ITA Airways
+    "IB": "MAD",  # Iberia
+    "UX": "MAD",  # Air Europa
+    "TP": "LIS",  # TAP Air Portugal
+    "TK": "IST",  # Turkish Airlines
+    "QR": "DOH",  # Qatar Airways
+    "EY": "AUH",  # Etihad Airways
+    "EK": "DXB",  # Emirates
+    "WY": "MCT",  # Oman Air
+    "GF": "BAH",  # Gulf Air
+    "RJ": "AMM",  # Royal Jordanian
+    "KU": "KWI",  # Kuwait Airways
+    "UL": "CMB",  # SriLankan Airlines
+    "MS": "CAI",  # EgyptAir
+    "AT": "CMN",  # Royal Air Maroc
+}
+
+# Bekannte Nonstop-Sonderstrecken / 5th-Freedom-Flüge außerhalb des Haupt-Hubs
+KNOWN_NONSTOP_EXCEPTIONS: set[tuple[str, str, str]] = {
+    ("LO", "BUD", "ICN"),
+    ("EK", "BCN", "MEX"),
+    ("EK", "MXP", "JFK"),
+    ("EK", "ATH", "EWR"),
+    ("EK", "LCA", "MLA"),
+    ("EK", "BKK", "HKG"),
+    ("KL", "SIN", "DPS"),
+    ("KL", "CGK", "KUL"),
+    ("KL", "EZE", "SCL"),
+    ("TK", "GRU", "EZE"),
+    ("TK", "SIN", "MEL"),
+}
+
+_NONSTOP_MARKERS = {
+    "none",
+    "null",
+    "nonstop",
+    "non-stop",
+    "direct",
+    "direkt",
+    "direktflug",
+    "kein",
+    "keine",
+    "keiner",
+    "kein stopp",
+    "-",
+}
+
+_STOP_TOKEN_BLACKLIST = {
+    "VIA",
+    "UND",
+    "AND",
+    "MIT",
+    "VON",
+    "BIS",
+    "AUF",
+    "NUR",
+    "HIN",
+    "PRO",
+    "MAX",
+    "MIN",
+    "STD",
+    "TAG",
+    "NON",
+    "THE",
+    "FOR",
+    "ONE",
+    "TWO",
+    "EUR",
+    "USD",
+    "CHF",
+    "GBP",
+}
+
+
+def normalize_iata_via(raw_via: list[str] | None, origin: str = "", destination: str = "") -> list[str]:
+    """Bereinigt und normalisiert Zwischenstopp-Angaben auf saubere 3-Letter IATA-Codes (bzw. 'FRA/MUC')."""
+    if not raw_via:
+        return []
+
+    orig = (origin or "").strip().upper()
+    dest = (destination or "").strip().upper()
+    excluded = {c for c in (orig, dest) if c}
+    cleaned: list[str] = []
+
+    for entry in raw_via:
+        if not isinstance(entry, str):
+            continue
+        text = entry.strip()
+        if not text or text.lower() in _NONSTOP_MARKERS:
+            continue
+
+        # Fall 1: Reiner IATA-Code oder Schrägstrich-Alternative (z.B. 'HEL' oder 'FRA/MUC')
+        if re.fullmatch(r"[A-Za-z]{3}(?:\s*/\s*[A-Za-z]{3})*", text):
+            parts = [p.strip().upper() for p in text.split("/")]
+            valid_parts = [p for p in parts if p not in excluded and p not in _STOP_TOKEN_BLACKLIST]
+            if valid_parts:
+                token = "/".join(dict.fromkeys(valid_parts))
+                if token not in cleaned:
+                    cleaned.append(token)
+            continue
+
+        # Fall 2: Stadtname mit IATA-Code in Klammern, z.B. 'Helsinki (HEL)'
+        paren_codes = re.findall(r"\(([A-Za-z]{3})\)", text)
+        if paren_codes:
+            for code in paren_codes:
+                up = code.upper()
+                if up not in excluded and up not in _STOP_TOKEN_BLACKLIST and up not in cleaned:
+                    cleaned.append(up)
+            continue
+
+        # Fall 3: Freitext mit großgeschriebenen 3-Letter-Codes, z.B. 'via HEL' oder 'AMS-HEL-BKK'
+        upper_tokens = re.findall(r"\b([A-Z]{3})\b", text)
+        for up in upper_tokens:
+            if up not in excluded and up not in _STOP_TOKEN_BLACKLIST and up not in cleaned:
+                cleaned.append(up)
+
+    return cleaned
+
+
+def _extract_stops_from_advice(routing_advice: str, origin: str, destination: str) -> list[str]:
+    """Extrahiert explizit genannte Umsteige-/Stopover-Flughäfen aus routing_advice (ignoriert 'Auch ab XXX')."""
+    if not routing_advice:
+        return []
+    orig = (origin or "").strip().upper()
+    dest = (destination or "").strip().upper()
+    excluded = {c for c in (orig, dest) if c} | _STOP_TOKEN_BLACKLIST
+    found: list[str] = []
+
+    pattern = re.compile(
+        r"\b(?:layover|umstieg|zwischenstopp|stopover|via|über)\s+(?:in\s+)?"
+        r"(?:[A-Za-zÄÖÜäöüß\-\s]{1,25}?\(([A-Z]{3})\)|([A-Z]{3})(?:\s*/\s*([A-Z]{3}))?\b)",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(routing_advice):
+        c_paren, c_direct, c_alt = m.group(1), m.group(2), m.group(3)
+        if c_paren:
+            code = c_paren.upper()
+            if code not in excluded and code not in found:
+                found.append(code)
+        elif c_direct and c_direct.isupper():
+            parts = [c_direct.upper()]
+            if c_alt and c_alt.isupper():
+                parts.append(c_alt.upper())
+            valid = [p for p in parts if p not in excluded]
+            if valid:
+                token = "/".join(dict.fromkeys(valid))
+                if token not in found:
+                    found.append(token)
+    return found
+
+
+def resolve_deal_stops(deal: FlightDealEvaluation) -> list[str]:
+    """
+    Ermittelt die erforderlichen Zwischenstopps einer Route mehrstufig:
+    1. Aus 'deal.iata_via' (vom Modell extrahiert und deterministisch bereinigt).
+    2. Fallback über explizite Umstiegs-/Stopover-Nennungen in 'deal.routing_advice'.
+    3. Deterministisches Airline-Drehkreuz-Fallback (z.B. Finnair AY -> HEL, Qatar QR -> DOH, SWISS LX -> ZRH),
+       sofern weder Start noch Ziel bereits das Drehkreuz sind und keine Nonstop-Sonderstrecke vorliegt.
+    """
+    if deal is None:
+        return []
+
+    orig = (deal.iata_origin or "").strip().upper()
+    dest = (deal.iata_destination or "").strip().upper()
+
+    # 1. Primärquelle: deal.iata_via
+    stops = normalize_iata_via(deal.iata_via, orig, dest)
+    if stops:
+        return stops
+
+    # Für ungültige Platzhalter-Codes keine Heuristik anwenden
+    invalid_placeholders = {"EUR", "ASI", "UNK", "XXX"}
+    if (
+        not re.fullmatch(r"[A-Z]{3}", orig)
+        or not re.fullmatch(r"[A-Z]{3}", dest)
+        or orig == dest
+        or orig in invalid_placeholders
+        or dest in invalid_placeholders
+    ):
+        return []
+
+    # 2. Sekundärquelle: Expliziter Stopover/Layover/Umstieg-Hinweis in routing_advice
+    advice_stops = _extract_stops_from_advice(deal.routing_advice or "", orig, dest)
+    if advice_stops:
+        return advice_stops
+
+    # 3. Tertiärquelle: Zwingendes Airline-Drehkreuz bei Nicht-Hub-Verbindungen
+    primary = (deal.primary_airline_iata or "").strip().upper()
+    if not primary and deal.airline_names:
+        m = re.search(r"\(([A-Z0-9]{2})\)", deal.airline_names)
+        if m:
+            primary = m.group(1).upper()
+
+    if not primary:
+        return []
+
+    if (primary, orig, dest) in KNOWN_NONSTOP_EXCEPTIONS or (primary, dest, orig) in KNOWN_NONSTOP_EXCEPTIONS:
+        return []
+
+    # Spezifische Nebenbasen ausschließen, ab denen Direktflüge existieren
+    if primary == "AF" and orig == "ORY":
+        return []
+    if primary == "IB" and orig == "BCN":
+        return []
+    if primary == "TP" and orig == "OPO":
+        return []
+    if primary == "TK" and (orig in {"IST", "SAW", "ESB", "AYT", "ADB"} or dest in {"IST", "SAW", "ESB", "AYT", "ADB"}):
+        return []
+    if primary == "SQ" and deal.region == "Asien" and orig != "SIN" and dest != "SIN":
+        return ["SIN"]
+    if primary == "LH" and orig not in {"FRA", "MUC"} and dest not in {"FRA", "MUC"}:
+        return ["FRA/MUC"]
+
+    hub = SINGLE_HUB_AIRLINES.get(primary)
+    if hub and hub not in (orig, dest):
+        return [hub]
+
+    return []
+
+
+def format_deal_route_plain(deal: FlightDealEvaluation) -> str:
+    """Formatiert die vollständige Route inkl. Zwischenstopps als Klartext für Logs/CLI (z.B. 'AMS->HEL->BKK')."""
+    stops = resolve_deal_stops(deal)
+    nodes = [n for n in [deal.iata_origin, *stops, deal.iata_destination] if n]
+    route = "->".join(nodes)
+    if deal.is_open_jaw and deal.iata_return_end and deal.iata_return_end != deal.iata_origin:
+        route += f"->{deal.iata_return_end} (Gabelflug)"
+    return route
 
 
 def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str) -> tuple[bool, str]:
@@ -872,8 +1245,9 @@ def generate_with_gemini_fallback(
     preferred_model: str = "gemini-3.8-flash",
     enable_thinking: bool = False,
     max_transient_retries: int = 4,
+    http_timeout_ms: int = GEMINI_HTTP_TIMEOUT_MS,
 ) -> Any:
-    """Führt Content-Generierung mit automatischer Modell-Kaskade und intelligenter Retry-Logik aus."""
+    """Führt Content-Generierung mit automatischer Modell-Kaskade, striktem HTTP-Timeout und Retry-Logik aus."""
     fallback_models = [preferred_model]
     for fb in [
         "gemini-3.8-flash",
@@ -893,9 +1267,11 @@ def generate_with_gemini_fallback(
     while candidate_models and transient_attempt <= max_transient_retries:
         current_model = candidate_models[0]
 
-        # Konfiguration vorbereiten
+        # Konfiguration vorbereiten (inkl. explizitem Request-Timeout & deaktiviertem AFC-Overhead)
         gen_config: dict[str, Any] = {
             "temperature": 0.1,
+            "http_options": {"timeout": http_timeout_ms},
+            "automatic_function_calling": {"disable": True},
         }
         if response_schema:
             gen_config["response_mime_type"] = "application/json"
@@ -949,17 +1325,24 @@ def generate_with_gemini_fallback(
                     raise
                 continue
 
-            # Fall C: Transiente Fehler (429 Quota, 503 Overload, Timeout) -> Wait & Shift
-            is_transient = (isinstance(exc, errors.APIError) and exc.code in (408, 429, 500, 502, 503, 504)) or any(
-                code in exc_str
-                for code in (
-                    "503",
-                    "429",
-                    "UNAVAILABLE",
-                    "ResourceExhausted",
-                    "RESOURCE_EXHAUSTED",
-                    "timeout",
-                    "Timeout",
+            # Fall C: Transiente Fehler (429 Quota, 503 Overload, Netzwerk-/Socket-Timeouts) -> Wait & Shift
+            is_transient = (
+                (isinstance(exc, errors.APIError) and exc.code in (408, 429, 500, 502, 503, 504))
+                or isinstance(exc, (requests.exceptions.Timeout, requests.exceptions.ConnectionError, TimeoutError))
+                or any(
+                    code in exc_str
+                    for code in (
+                        "503",
+                        "429",
+                        "UNAVAILABLE",
+                        "ResourceExhausted",
+                        "RESOURCE_EXHAUSTED",
+                        "timeout",
+                        "Timeout",
+                        "Read timed out",
+                        "RemoteDisconnected",
+                        "Connection aborted",
+                    )
                 )
             )
 
@@ -1035,11 +1418,14 @@ STRIKTE REGELN FÜR 'is_relevant = True':
      * Setze deal_category = 'Irrelevant'
      * Setze rejection_reason = 'Nur Economy / Keine Business Class explizit genannt'
 2. Zielregion: {regions_str} (oder Nahost-Sweet-Spots für Miles & More QP: {sweet_spots_str}).
-3. STARTFLUGHAFEN & PRIORISIERUNG (KEIN ORIGIN-HIJACKING):
+3. STARTFLUGHAFEN, ZWISCHENSTOPPS & PRIORISIERUNG (KEIN ORIGIN-HIJACKING):
    - 'iata_origin' MUSS zwingend ein Flughafen sein, der im Artikel oder Buchungslink EXPLIZIT als buchbarer Abflugort für diesen Tarif genannt ist!
    - Wenn ein Deal NUR ab Warschau (WAW) oder Oslo (OSL) angeboten wird, MUSS iata_origin 'WAW' bzw. 'OSL' sein.
    - Es ist STRENGSTENS VERBOTEN, einen bevorzugten Hub ({hubs_str}) als iata_origin einzusetzen, wenn dieser Flughafen nicht im Artikel als buchbarer Abflugort aufgeführt ist!
    - Nur wenn der Deal MEHRERE Abflughäfen anbietet (z.B. 'Ab Frankfurt, München und Amsterdam'), wähle den bevorzugten Hub ({hubs_str}) als iata_origin. Nenne weitere Abflughäfen in 'routing_advice'.
+   - ERFORDERLICHE ZWISCHENSTOPPS ('iata_via'): Gib ALLE erforderlichen Umsteigeflughäfen zwischen iata_origin und iata_destination als 3-Letter IATA-Codes in Flugrichtung an (z.B. ['HEL'] bei Finnair AMS -> HEL -> BKK, ['DOH'] bei Qatar Airways, ['AUH'] bei Etihad, ['ZRH'] bei SWISS, ['WAW'] bei LOT ab Westeuropa, ['IST'] bei Turkish Airlines).
+   - Auch wenn das Drehkreuz im Text nicht ausdrücklich ausgeschrieben wird, die Hauptairline aber keinen Nonstop-Flug von iata_origin nach iata_destination durchführt, MUSS das erforderliche Drehkreuz der Airline in 'iata_via' stehen!
+   - Bei 1-Stopp-Verbindungen mit wahlweisem Hub (z.B. Lufthansa via Frankfurt oder München) schreibe ['FRA/MUC'] als EIN Element (nur bei zwei echten Stopps hintereinander zwei Elemente wie ['FRA', 'SIN']). Bei echten Nonstop-Flügen: [].
 4. Preis (Fremdwährungen wie USD, CHF, GBP, PLN, SEK, DKK zwingend in EUR umrechnen!):
    - Ab {hubs_str}: max. {price_hubs} EUR Return (Ideal < {price_ideal} EUR).
    - Ab Ex-EU (z.B. WAW, OSL, ARN, DUB, MXP, AMS, BUD): max. {price_ex_eu} EUR Return (bis {price_top_cabin} EUR nur bei Top-Kabinen wie Etihad A350/787 oder Qatar Qsuite).
@@ -1085,6 +1471,7 @@ Inhalt: {clean_text[:5000]}
 
     deal = response.parsed
     deal = normalize_and_verify_deal_mm_points(deal)
+    deal.iata_via = resolve_deal_stops(deal)
     is_ignored, ignored_air = is_deal_ignored_airline(deal, ignored_airlines)
     if is_ignored:
         deal.is_relevant = False
@@ -1110,8 +1497,10 @@ def build_telegram_message(
     if sample_booking and sample_booking.startswith("http"):
         booking_line = f'\n🔹 <a href="{html.escape(sample_booking, quote=True)}">Geprüftes Buchungsbeispiel (Skyscanner / OTA)</a>'
 
-    route_str = f"<code>{html.escape(deal.iata_origin)}</code> ➔ <code>{html.escape(deal.iata_destination)}</code>"
-    if deal.is_open_jaw and deal.iata_return_end != deal.iata_origin:
+    stops = resolve_deal_stops(deal)
+    route_nodes = [deal.iata_origin, *stops, deal.iata_destination]
+    route_str = " ➔ ".join(f"<code>{html.escape(node)}</code>" for node in route_nodes if node)
+    if deal.is_open_jaw and deal.iata_return_end and deal.iata_return_end != deal.iata_origin:
         route_str += f" ➔ <code>{html.escape(deal.iata_return_end)}</code> (Gabelflug)"
 
     ftl_info = ""
@@ -1361,6 +1750,11 @@ def fetch_all_feeds(
     return [(url, results_map.get(url, [])) for url in feed_urls if results_map.get(url)]
 
 
+def should_trip_circuit_breaker(consecutive_failures: int, threshold: int = GEMINI_CIRCUIT_BREAKER_THRESHOLD) -> bool:
+    """Prüft, ob nach zu vielen aufeinanderfolgenden Fehlern der aktuelle Zyklus vorzeitig pausiert werden soll."""
+    return threshold > 0 and consecutive_failures >= threshold
+
+
 def main():
     global SESSION
     signal.signal(signal.SIGINT, handle_shutdown_signal)
@@ -1368,11 +1762,15 @@ def main():
 
     validate_startup()
     conn = init_db()
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = create_genai_client()
 
-    # Initialer Heartbeat direkt beim Booten, damit Container-Healthcheck sofort grün ist
-    Path(HEARTBEAT_FILE).parent.mkdir(parents=True, exist_ok=True)
-    Path(HEARTBEAT_FILE).touch()
+    # Initialer Heartbeat & Start des Hintergrund-Watchdogs zur Selbstheilung bei Blockaden
+    watchdog = ActivityWatchdog(
+        max_inactivity_seconds=WATCHDOG_TIMEOUT_SECONDS,
+        check_interval_seconds=60.0,
+        heartbeat_file=HEARTBEAT_FILE,
+        stop_event=STOP_EVENT,
+    ).start()
 
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM seen_urls")
@@ -1394,10 +1792,12 @@ def main():
         )
 
     while not STOP_EVENT.is_set():
+        watchdog.beat(update_file=True)
         cleanup_db(conn)
 
         # 1. Paralleler Abruf aller Feeds in einer einzigen Welle (max_workers = len(RSS_FEEDS))
         feeds_entries = fetch_all_feeds(RSS_FEEDS, max_workers=len(RSS_FEEDS))
+        watchdog.beat(update_file=True)
 
         # 2. Round-Robin Interleaving: Reihum 1 Eintrag aus jedem Feed
         interleaved_entries = []
@@ -1408,12 +1808,16 @@ def main():
                     interleaved_entries.append((entries[idx], feed_url))
 
         evaluated_seed_deals = 0
+        consecutive_eval_failures = 0
+        circuit_breaker_tripped = False
 
         # 3. Durchlaufe die ausgewogenen Einträge
         for entry, feed_url in interleaved_entries:
             if STOP_EVENT.is_set():
                 logging.info("Stopp-Signal erhalten. Breche aktuellen Verarbeitungszyklus ab.")
                 break
+
+            watchdog.beat(update_file=True)
 
             try:
                 raw_link = entry.get("link", "")
@@ -1459,13 +1863,39 @@ def main():
                             continue
 
                 full_text, sample_booking = get_enriched_deal_context(raw_content, raw_link)
-                deal = evaluate_with_gemini(client, title, full_text)
+                watchdog.beat(update_file=True)
+
+                try:
+                    deal = evaluate_with_gemini(client, title, full_text)
+                    consecutive_eval_failures = 0
+                except Exception as gemini_err:
+                    consecutive_eval_failures += 1
+                    watchdog.beat(update_file=True)
+                    logging.error(
+                        "KI-Auswertung fehlgeschlagen (%d/%d in Folge) für %s: %s",
+                        consecutive_eval_failures,
+                        GEMINI_CIRCUIT_BREAKER_THRESHOLD,
+                        entry.get("link", "unbekannt"),
+                        gemini_err,
+                    )
+                    if should_trip_circuit_breaker(consecutive_eval_failures):
+                        circuit_breaker_tripped = True
+                        logging.warning(
+                            "Circuit-Breaker ausgelöst nach %d fehlgeschlagenen KI-Auswertungen in Folge. "
+                            "Pausiere restliche Einträge bis zum nächsten Zyklus in %ds...",
+                            consecutive_eval_failures,
+                            CHECK_INTERVAL,
+                        )
+                        break
+                    continue
+
+                watchdog.beat(update_file=True)
 
                 # 2. Deterministischer Post-Validation Airbag
                 is_safe, safety_veto_reason = validate_deal_safety(deal, title, full_text)
                 if not is_safe:
                     logging.warning(
-                        f"Sicherheits-Veto für {deal.iata_origin}->{deal.iata_destination} ({deal.price_eur}€): {safety_veto_reason}"
+                        f"Sicherheits-Veto für {format_deal_route_plain(deal)} ({deal.price_eur}€): {safety_veto_reason}"
                     )
                     deal.is_relevant = False
                     deal.deal_category = "Irrelevant"
@@ -1484,10 +1914,12 @@ def main():
                         record_sent_deal(conn, deal)
                         if send_reason == "price_drop":
                             logging.info(
-                                f"Deal-Preisupdate gepusht: {fingerprint} ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
+                                f"Deal-Preisupdate gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
                             )
                         else:
-                            logging.info(f"Neuer Deal gepusht: {fingerprint} ({deal.price_eur}€, {deal.airline_names})")
+                            logging.info(
+                                f"Neuer Deal gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€, {deal.airline_names})"
+                            )
                         time.sleep(2)
                     else:
                         logging.info(
@@ -1500,7 +1932,7 @@ def main():
                         else f"Kategorie: {deal.deal_category}"
                     )
                     logging.info(
-                        f"Deal verworfen ({deal.iata_origin}->{deal.iata_destination}, {deal.price_eur}€, {deal.airline_names}): {reason}"
+                        f"Deal verworfen ({format_deal_route_plain(deal)}, {deal.price_eur}€, {deal.airline_names}): {reason}"
                     )
 
                 # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL als gesehen speichern
@@ -1509,12 +1941,12 @@ def main():
             except Exception as entry_err:
                 logging.error(f"Fehler bei Eintrag {entry.get('link', 'unbekannt')}: {entry_err}")
 
-        if is_new_db:
+        if is_new_db and not circuit_breaker_tripped:
             logging.info("Initialer Start-Zyklus erfolgreich abgeschlossen. Live-Überwachung aktiv.")
             is_new_db = False
 
         # Heartbeat nach jedem Zyklus aktualisieren
-        Path(HEARTBEAT_FILE).touch()
+        watchdog.beat(update_file=True)
 
         # Idle TCP-Verbindungen im Session-Pool schließen und frischen Pool für den nächsten Zyklus bereitstellen
         SESSION.close()
@@ -1524,7 +1956,7 @@ def main():
             break
 
         logging.info(f"Zyklus abgeschlossen. Nächster Durchlauf in {CHECK_INTERVAL}s...")
-        if STOP_EVENT.wait(timeout=CHECK_INTERVAL):
+        if wait_for_next_cycle(CHECK_INTERVAL, stop_event=STOP_EVENT, watchdog=watchdog):
             logging.info("Bot wurde gestoppt. Fahre geordnet herunter.")
             break
 

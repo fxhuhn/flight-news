@@ -3,15 +3,15 @@ import time
 from datetime import datetime
 
 import feedparser
-from google import genai
 
 from bot import (
-    GEMINI_API_KEY,
     IGNORED_AIRLINES,
     NEGATIVE_KEYWORDS,
     RSS_FEEDS,
+    create_genai_client,
     evaluate_with_gemini,
     fetch_feed_content,
+    format_deal_route_plain,
     get_enriched_deal_context,
     init_db,
     is_airline_ignored_in_text,
@@ -29,7 +29,7 @@ def run_batch():
     validate_startup()
     conn = init_db()
     c = conn.cursor()
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    client = create_genai_client()
 
     print("=" * 65)
     print(f"🚀 STARTE INITIALEN LIVE-LAUF FÜR TELEGRAM (Ziel: {TARGET_COUNT} Deals)")
@@ -118,18 +118,19 @@ def run_batch():
                     c.execute("INSERT INTO sent_deals (deal_fingerprint) VALUES (?)", (fingerprint,))
                     sent_count += 1
 
+                    route_plain = format_deal_route_plain(deal)
                     pushed_deals.append(
                         {
                             "nr": sent_count,
                             "airline": deal.airline_names,
-                            "route": f"{deal.iata_origin}->{deal.iata_destination}",
+                            "route": route_plain,
                             "price": f"{deal.price_eur} €",
                             "points": f"{deal.mm_points} P / {deal.mm_qualifying_points} QP",
                             "title": title[:60],
                         }
                     )
                     print(
-                        f"  👉 GEPUSHT (#{sent_count}): {deal.iata_origin}->{deal.iata_destination} | {deal.price_eur}€ | {deal.airline_names} | {deal.mm_points}P/{deal.mm_qualifying_points}QP"
+                        f"  👉 GEPUSHT (#{sent_count}): {route_plain} | {deal.price_eur}€ | {deal.airline_names} | {deal.mm_points}P/{deal.mm_qualifying_points}QP"
                     )
                     time.sleep(2)  # Pause für Telegram Rate-Limits
                 else:
