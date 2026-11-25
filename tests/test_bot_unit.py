@@ -32,6 +32,7 @@ from bot import (
     normalize_iata_via,
     normalize_url,
     record_sent_deal,
+    resolve_deal_category,
     resolve_deal_stops,
     should_send_deal,
     should_trip_circuit_breaker,
@@ -79,7 +80,7 @@ def test_database_and_deduplication():
             detected_cabin_class="Business Class",
             cabin_class_quote="Fliege mit Royal Jordanian nach Bangkok",
             is_relevant=True,
-            deal_category="Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
+            deal_category="Top-Bordprodukt (Oneworld)",
             airline_names="Royal Jordanian (RJ)",
             primary_airline_iata="RJ",
             iata_origin="FRA",
@@ -196,7 +197,7 @@ def test_airline_ignore_filter():
         detected_cabin_class="Business Class",
         cabin_class_quote="Fliege in der SWISS Business Class nach Bangkok",
         is_relevant=True,
-        deal_category="Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
+        deal_category="Top-Bordprodukt",
         airline_names="",
         primary_airline_iata="",
         iata_origin="FRA",
@@ -333,7 +334,7 @@ def test_telegram_formatting_and_redundancy_defense():
         detected_cabin_class="Business Class",
         cabin_class_quote="Business Class Round Trip",
         is_relevant=True,
-        deal_category="Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
+        deal_category="Top-Bordprodukt",
         airline_names="Etihad Airways",
         primary_airline_iata="EY",
         iata_origin="PRG",
@@ -358,6 +359,10 @@ def test_telegram_formatting_and_redundancy_defense():
         }
     )
     msg_red = build_telegram_message(deal_redundant, "Prague -> Beijing", "https://example.com/deal")
+    assert "✈️ <b>Top-Bordprodukt</b>\n" in msg_red
+    assert "Non-Alliance" not in msg_red
+    assert "Oneworld" not in msg_red
+    assert "SkyTeam" not in msg_red
     assert "Besonderheiten:" not in msg_red
     assert "Etihad Airways ist nicht in einer Allianz" not in msg_red
 
@@ -370,6 +375,94 @@ def test_telegram_formatting_and_redundancy_defense():
     )
     msg_feat = build_telegram_message(deal_features, "Prague -> Beijing", "https://example.com/deal")
     assert "Stopover in AUH kostenlos" in msg_feat
+
+
+def test_alliance_display_in_top_bordprodukt():
+    from google.genai import _transformers
+
+    schema = _transformers.t_schema(None, FlightDealEvaluation)
+    cat_enum = schema.properties["deal_category"].enum
+    assert "Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)" not in cat_enum
+    assert "Top-Bordprodukt" in cat_enum
+    assert "Top-Bordprodukt (Oneworld)" in cat_enum
+    assert "Top-Bordprodukt (SkyTeam)" in cat_enum
+
+    # 1. Allianzlose Airlines (z.B. Etihad EY, China Southern CZ, Emirates EK, Gulf Air GF):
+    #    Keine Allianz vorhanden -> es darf gar kein Allianz-Klammerzusatz angezeigt werden!
+    deal_ey = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Amsterdam -> East & South East Asia Business Class Round Trip 1785€",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt (Oneworld)",  # selbst bei falscher KI-Zuordnung korrigiert
+        airline_names="Etihad Airways (EY)",
+        primary_airline_iata="EY",
+        iata_origin="AMS",
+        iata_destination="BKK",
+        is_open_jaw=False,
+        iata_return_end="AMS",
+        region="Asien",
+        sample_outbound_date="2027-01-15",
+        sample_return_date="2027-01-29",
+        price_eur=1785,
+        booking_class="Z",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="Business Studio",
+        routing_advice="",
+        rejection_reason="",
+    )
+    deal_ey_norm = normalize_and_verify_deal_mm_points(deal_ey.model_copy())
+    assert deal_ey_norm.deal_category == "Top-Bordprodukt"
+    msg_ey = build_telegram_message(
+        deal_ey,
+        "Amsterdam → East & South East Asia Business Class Round Trip 1785€",
+        "https://example.com/ams-asia",
+    )
+    assert msg_ey.startswith("✈️ <b>Top-Bordprodukt</b>\n")
+    assert "(" not in msg_ey.splitlines()[0]
+
+    msg_ey_drop = build_telegram_message(
+        deal_ey_norm,
+        "Amsterdam → East & South East Asia Business Class Round Trip 1785€",
+        "https://example.com/ams-asia",
+        prev_price=1950,
+    )
+    assert msg_ey_drop.startswith("📉 <b>PREIS-UPDATE: Top-Bordprodukt</b>\n")
+
+    deal_cz = deal_ey.model_copy(
+        update={
+            "deal_category": "Top-Bordprodukt (SkyTeam)",
+            "airline_names": "China Southern Airlines (CZ)",
+            "primary_airline_iata": "CZ",
+        }
+    )
+    assert resolve_deal_category(deal_cz) == "Top-Bordprodukt"
+
+    # 2. Oneworld-Airline (z.B. Qatar Airways QR, Oman Air WY, Finnair AY) -> Top-Bordprodukt (Oneworld)
+    deal_qr = deal_ey.model_copy(
+        update={
+            "deal_category": "Top-Bordprodukt",
+            "airline_names": "Qatar Airways (QR)",
+            "primary_airline_iata": "QR",
+        }
+    )
+    deal_qr_norm = normalize_and_verify_deal_mm_points(deal_qr)
+    assert deal_qr_norm.deal_category == "Top-Bordprodukt (Oneworld)"
+    msg_qr = build_telegram_message(deal_qr_norm, "Amsterdam → Bangkok", "https://example.com/qr")
+    assert msg_qr.startswith("✈️ <b>Top-Bordprodukt (Oneworld)</b>\n")
+
+    # 3. SkyTeam-Airline (z.B. KLM KL, Vietnam Airlines VN) -> Top-Bordprodukt (SkyTeam)
+    deal_kl = deal_ey.model_copy(
+        update={
+            "deal_category": "Top-Bordprodukt",
+            "airline_names": "KLM (KL)",
+            "primary_airline_iata": "KL",
+        }
+    )
+    deal_kl_norm = normalize_and_verify_deal_mm_points(deal_kl)
+    assert deal_kl_norm.deal_category == "Top-Bordprodukt (SkyTeam)"
+    msg_kl = build_telegram_message(deal_kl_norm, "Amsterdam → Bangkok", "https://example.com/kl")
+    assert msg_kl.startswith("✈️ <b>Top-Bordprodukt (SkyTeam)</b>\n")
 
 
 def test_required_intermediate_stops_in_telegram_message():
@@ -385,7 +478,7 @@ def test_required_intermediate_stops_in_telegram_message():
         detected_cabin_class="Business Class",
         cabin_class_quote="European Cities -> Bangkok Business Class Round Trip from 1785€",
         is_relevant=True,
-        deal_category="Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
+        deal_category="Top-Bordprodukt (Oneworld)",
         airline_names="Finnair (AY)",
         primary_airline_iata="AY",
         iata_origin="AMS",

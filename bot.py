@@ -392,6 +392,16 @@ def _make_iata_via_required(schema: dict[str, Any]) -> None:
         req.append("iata_via")
 
 
+DealCategory = Literal[
+    "FTL-Booster (Points + QP)",
+    "Star Alliance (Nur Points)",
+    "Top-Bordprodukt (Oneworld)",
+    "Top-Bordprodukt (SkyTeam)",
+    "Top-Bordprodukt",
+    "Irrelevant",
+]
+
+
 class FlightDealEvaluation(BaseModel):
     model_config = ConfigDict(json_schema_extra=_make_iata_via_required)
 
@@ -419,17 +429,15 @@ class FlightDealEvaluation(BaseModel):
             "3. Zielregion & Preislimit in EUR eingehalten."
         )
     )
-    deal_category: Literal[
-        "FTL-Booster (Points + QP)",
-        "Star Alliance (Nur Points)",
-        "Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)",
-        "Irrelevant",
-    ] = Field(
+    deal_category: DealCategory = Field(
         description=(
             "Kategorie des Deals: 'FTL-Booster (Points + QP)' für alle vollintegrierten Miles & More Partner "
-            "(LH, LX, OS, SN, EW, 4Y, EN, LO / LOT Polish Airlines, AZ, LG, OU), "
+            "(LH, VL, LX, OS, SN, EW, 4Y, EN, LO / LOT Polish Airlines, AZ, LG, OU), "
             "'Star Alliance (Nur Points)' für reine Star Alliance Partner ohne QP (TK, SQ, TP, UA etc.), "
-            "'Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)', oder 'Irrelevant'."
+            "'Top-Bordprodukt (Oneworld)' für Oneworld-Airlines (QR, AY, BA, CX, JL, WY, RJ, IB, UL, AT, MH, QF, AA), "
+            "'Top-Bordprodukt (SkyTeam)' für SkyTeam-Airlines (AF, KL, VS, UX, SK, SV, KE, CI, VN, GA, MU, MF, DL, AM), "
+            "'Top-Bordprodukt' ohne Klammerzusatz für allianzlose Airlines (z.B. EY, EK, GF, CZ, DE, KU, JX), "
+            "oder 'Irrelevant'."
         )
     )
     airline_names: str = Field(description="Namen und IATA-Codes der Airlines, z.B. 'SWISS (LX)' oder 'Etihad (EY)'")
@@ -585,15 +593,144 @@ VOLLINTEGRIERTE_MM_AIRLINES = {
     "OU",  # Croatia Airlines
 }
 
+ONEWORLD_AIRLINES = {
+    "AA",  # American Airlines
+    "AS",  # Alaska Airlines
+    "AT",  # Royal Air Maroc
+    "AY",  # Finnair
+    "BA",  # British Airways
+    "CX",  # Cathay Pacific
+    "FJ",  # Fiji Airways
+    "HA",  # Hawaiian Airlines
+    "IB",  # Iberia
+    "JL",  # Japan Airlines
+    "MH",  # Malaysia Airlines
+    "QF",  # Qantas
+    "QR",  # Qatar Airways
+    "RJ",  # Royal Jordanian
+    "UL",  # SriLankan Airlines
+    "WY",  # Oman Air
+}
+
+SKYTEAM_AIRLINES = {
+    "AF",  # Air France
+    "AM",  # Aeroméxico
+    "AR",  # Aerolíneas Argentinas
+    "CI",  # China Airlines
+    "DL",  # Delta Air Lines
+    "FM",  # Shanghai Airlines
+    "GA",  # Garuda Indonesia
+    "KE",  # Korean Air
+    "KL",  # KLM
+    "KQ",  # Kenya Airways
+    "ME",  # Middle East Airlines
+    "MF",  # XiamenAir
+    "MU",  # China Eastern
+    "RO",  # TAROM
+    "SK",  # SAS Scandinavian Airlines
+    "SV",  # Saudia
+    "UX",  # Air Europa
+    "VN",  # Vietnam Airlines
+    "VS",  # Virgin Atlantic
+}
+
+_ONEWORLD_NAME_KEYWORDS = (
+    "qatar airways",
+    "finnair",
+    "british airways",
+    "cathay pacific",
+    "japan airlines",
+    "oman air",
+    "royal jordanian",
+    "iberia",
+    "srilankan",
+    "royal air maroc",
+    "malaysia airlines",
+    "qantas",
+    "american airlines",
+    "alaska airlines",
+    "hawaiian airlines",
+    "fiji airways",
+)
+
+_SKYTEAM_NAME_KEYWORDS = (
+    "air france",
+    "klm",
+    "virgin atlantic",
+    "air europa",
+    "scandinavian airlines",
+    "saudia",
+    "korean air",
+    "china airlines",
+    "vietnam airlines",
+    "garuda indonesia",
+    "china eastern",
+    "shanghai airlines",
+    "xiamenair",
+    "xiamen airlines",
+    "delta air lines",
+    "aeromexico",
+    "aeroméxico",
+    "aerolineas argentinas",
+    "aerolíneas argentinas",
+    "kenya airways",
+    "middle east airlines",
+    "tarom",
+)
+
+
+def resolve_deal_category(deal: FlightDealEvaluation) -> DealCategory:
+    """
+    Ermittelt die präzise Anzeigekategorie eines Deals:
+    - Vollintegrierte Miles & More Partner / Star Alliance behalten ihre Punkte-Kategorie.
+    - Bei 'Top-Bordprodukt'-Deals wird ausschließlich die tatsächliche Allianz angezeigt:
+      'Top-Bordprodukt (Oneworld)' bzw. 'Top-Bordprodukt (SkyTeam)'.
+    - Hat die Airline keine Allianz (z.B. Etihad, Emirates, Gulf Air, China Southern, Condor),
+      wird ohne jeden Klammerzusatz nur 'Top-Bordprodukt' ausgegeben.
+    """
+    cat = deal.deal_category
+    if not deal.is_relevant or cat == "Irrelevant":
+        return "Irrelevant" if cat == "Irrelevant" else cat
+
+    if not cat.startswith("Top-Bordprodukt"):
+        return cat
+
+    code = (deal.primary_airline_iata or "").strip().upper()
+    if not code and deal.airline_names:
+        m = re.search(r"\(([A-Z0-9]{2})\)", deal.airline_names)
+        if m:
+            code = m.group(1).upper()
+
+    if code:
+        if code in ONEWORLD_AIRLINES:
+            return "Top-Bordprodukt (Oneworld)"
+        if code in SKYTEAM_AIRLINES:
+            return "Top-Bordprodukt (SkyTeam)"
+        return "Top-Bordprodukt"
+
+    names_lower = (deal.airline_names or "").strip().lower()
+    if names_lower:
+        if any(kw in names_lower for kw in _ONEWORLD_NAME_KEYWORDS):
+            return "Top-Bordprodukt (Oneworld)"
+        if any(kw in names_lower for kw in _SKYTEAM_NAME_KEYWORDS):
+            return "Top-Bordprodukt (SkyTeam)"
+        return "Top-Bordprodukt"
+
+    if cat in ("Top-Bordprodukt (Oneworld)", "Top-Bordprodukt (SkyTeam)"):
+        return cat
+    return "Top-Bordprodukt"
+
 
 def normalize_and_verify_deal_mm_points(deal: FlightDealEvaluation) -> FlightDealEvaluation:
     """
-    Normalisiert und verifiziert die Miles & More Punkte sowie Airline-Codes:
+    Normalisiert und verifiziert die Miles & More Punkte sowie Airline-Codes & Allianzen:
     1. Normalisiert 'LOT' (3-Letter Code) zum 2-Letter IATA Code 'LO'.
     2. Erkennt LOT Polish Airlines zuverlässig anhand des Namens.
-    3. Stellt sicher, dass vollintegrierte Partner (LH, LX, OS, SN, EW, 4Y, EN, LO, AZ, LG, OU)
+    3. Stellt sicher, dass vollintegrierte Partner (LH, VL, LX, OS, SN, EW, 4Y, EN, LO, AZ, LG, OU)
        korrekt als 'FTL-Booster (Points + QP)' eingestuft werden und Points == QP gilt.
        (LOT Polish Airlines ist vollintegrierter Partner und vergibt IMMER volle QP).
+    4. Normalisiert 'Top-Bordprodukt'-Kategorien anhand der tatsächlichen Allianz (Oneworld, SkyTeam
+       oder ohne Klammerzusatz bei allianzlosen Airlines).
     """
     if deal is None:
         return deal
@@ -618,7 +755,9 @@ def normalize_and_verify_deal_mm_points(deal: FlightDealEvaluation) -> FlightDea
         if deal.is_relevant and deal.mm_points > 0:
             if deal.deal_category == "Star Alliance (Nur Points)":
                 deal.deal_category = "FTL-Booster (Points + QP)"
+        return deal
 
+    deal.deal_category = resolve_deal_category(deal)
     return deal
 
 
@@ -1482,7 +1621,10 @@ STRIKTE REGELN FÜR 'is_relevant = True':
    - KRITISCH Edelweiss (WK): Gibt 0 Points/0 QP unter WK-Flugnummer! Nur unter LX-Codeshare (LX8000-8499) gibt es Punkte/QP.
    - KRITISCH Asiana (OZ): Seit 15.10.2026 ausgeschieden -> 0 Points / 0 QP!
    - Andere Star Alliance (SQ, TP, TK, BR, NH, UA, AC, CM, AV, TG, ET, CA, MS, AI, ZH): Bringen NUR Points (40 kontinental / 200 pro Langstrecke), aber 0 QP!
-   - Fremd-Allianzen (EY, QR, AY, WY, GF, BA, AF, KL, CX, JL): 0 Points / 0 QP, aber als 'Top-Bordprodukt (Non-Alliance/Oneworld/SkyTeam)' relevant wenn Preis (< {price_ex_eu}-{price_top_cabin} EUR) & Hardware (z.B. Qsuite, Etihad Business Studio, Oman Air Apex Suite) stimmen.
+   - Fremd-Allianzen & allianzlose Airlines: 0 Points / 0 QP, aber relevant wenn Preis (< {price_ex_eu}-{price_top_cabin} EUR) & Hardware (z.B. Qsuite, Etihad Business Studio, Oman Air Apex Suite) stimmen:
+     * Oneworld (QR, AY, BA, CX, JL, WY, RJ, IB, UL, AT, MH, QF, AA): deal_category = 'Top-Bordprodukt (Oneworld)'
+     * SkyTeam (AF, KL, VS, UX, SK, SV, KE, CI, VN, GA, MU, MF, DL, AM): deal_category = 'Top-Bordprodukt (SkyTeam)'
+     * Keine Allianz (z.B. EY, EK, GF, CZ, DE, KU, JX): deal_category = 'Top-Bordprodukt' (OHNE Allianz-Klammerzusatz!)
 6. Besonderheiten & Tarifdetails ('routing_advice'):
    - Nenne HIER nur echte operative Zusatzfakten aus dem Text: weitere buchbare Abflughäfen, außergewöhnlich lange Layover (> 8h), Flughafenwechsel oder Tarifregeln (Stopover/Mindestaufenthalt).
    - WICHTIG & STRENG VERBOTEN: Wiederhole NIEMALS Meilen, 0 Points/QP, Allianzen, Positionierungshinweise (24h-Puffer) oder generische Preis-Checks / Buchungstipps (wie 'OTA-Bestpreis vs. Direktbuchung', Momondo/Kayak/Skyscanner, Zahlungsaufschläge, Phantom-Verfügbarkeit)!
@@ -1575,12 +1717,13 @@ def build_telegram_message(
         advice_line = f"• <b>Besonderheiten:</b> {html.escape(raw_advice)}\n"
 
     # Header & Preisangabe (bei Preissenkungen hervorheben)
+    category_label = resolve_deal_category(deal)
     if prev_price > 0 and prev_price > deal.price_eur:
-        header_line = f"📉 <b>PREIS-UPDATE: {html.escape(deal.deal_category)}</b>"
+        header_line = f"📉 <b>PREIS-UPDATE: {html.escape(category_label)}</b>"
         diff = prev_price - deal.price_eur
         price_line = f"• <b>Preis:</b> ~{deal.price_eur} € 📉 <i>(-{diff} € gegenüber bisher ~{prev_price} €!)</i> (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
     else:
-        header_line = f"✈️ <b>{html.escape(deal.deal_category)}</b>"
+        header_line = f"✈️ <b>{html.escape(category_label)}</b>"
         price_line = (
             f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
         )
