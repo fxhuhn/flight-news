@@ -52,3 +52,6 @@ max_entries_per_feed = 25
 # Haltedauer (in Tagen) für gesendete Deals in sent_deals (Duplikatsperre & Preissturz-Historie)
 sent_deals_retention_days = 21
 
+# Google Flights Live-Preis-Check (Soft-Check mit Fail-Open, inkl. optionalem Positionierungsflug)
+enable_google_flights_live_check = true
+

@@ -10,7 +10,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 try:
@@ -24,7 +25,8 @@ import feedparser
 import requests
 import requests.adapters
 import trafilatura
-from fast_flights import FlightQuery, Passengers, create_query
+from fast_flights import FlightQuery, Passengers, Query, create_query
+from fast_flights.parser import parse as parse_gf_html
 from fast_flights.pb import flights_pb2
 from google import genai
 from google.genai import errors
@@ -204,6 +206,7 @@ def load_config() -> dict[str, Any]:
             "initial_seed_max_deals": 5,
             "max_entries_per_feed": 25,
             "sent_deals_retention_days": 21,
+            "enable_google_flights_live_check": True,
         },
     }
     if CONFIG_PATH.exists():
@@ -238,6 +241,13 @@ SENT_DEALS_RETENTION_DAYS: int = max(
     1,
     int(os.environ.get("SENT_DEALS_RETENTION_DAYS", CONFIG.get("system", {}).get("sent_deals_retention_days", 21))),
 )
+_gf_live_check_env = os.environ.get("ENABLE_GF_LIVE_CHECK")
+ENABLE_GF_LIVE_CHECK: bool = (
+    _gf_live_check_env.strip().lower() in ("1", "true", "yes", "on")
+    if _gf_live_check_env is not None
+    else bool(CONFIG.get("system", {}).get("enable_google_flights_live_check", True))
+)
+GF_LIVE_CHECK_TIMEOUT_SECONDS: int = max(3, int(os.environ.get("GF_LIVE_CHECK_TIMEOUT_SECONDS", "12")))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
@@ -1064,6 +1074,8 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
             "HEL": ["HELSINKI"],
             "ATH": ["ATHEN", "ATHENS"],
             "IST": ["ISTANBUL"],
+            "OTP": ["BUKAREST", "BUCHAREST"],
+            "KEF": ["REYKJAVIK", "KEFLAVIK"],
         }
         aliases = airport_aliases.get(origin, [])
         if not any(alias in combined_upper for alias in aliases):
@@ -1354,11 +1366,101 @@ def get_enriched_deal_context(raw_content: str, article_url: str = "") -> tuple[
     return feed_text, sample_booking
 
 
-def build_gf_main_url(deal: FlightDealEvaluation) -> str:
+# Stadt-/Metro-IATA-Codes, die Google Flights im Protobuf-Feld 'airport' nicht zuverlässig auflöst
+METRO_TO_PRIMARY_AIRPORT: dict[str, str] = {
+    "PAR": "CDG",  # Paris -> Charles de Gaulle
+    "LON": "LHR",  # London -> Heathrow
+    "ROM": "FCO",  # Rom -> Fiumicino
+    "MIL": "MXP",  # Mailand -> Malpensa
+    "STO": "ARN",  # Stockholm -> Arlanda
+    "TYO": "HND",  # Tokio -> Haneda
+    "OSA": "KIX",  # Osaka -> Kansai
+    "SEL": "ICN",  # Seoul -> Incheon
+    "BJS": "PEK",  # Peking -> Capital
+    "JKT": "CGK",  # Jakarta -> Soekarno-Hatta
+    "NYC": "JFK",  # New York -> JFK
+    "WAS": "IAD",  # Washington -> Dulles
+    "CHI": "ORD",  # Chicago -> O'Hare
+    "YTO": "YYZ",  # Toronto -> Pearson
+    "YMQ": "YUL",  # Montreal -> Trudeau
+    "SAO": "GRU",  # São Paulo -> Guarulhos
+    "RIO": "GIG",  # Rio de Janeiro -> Galeão
+    "BUE": "EZE",  # Buenos Aires -> Ezeiza
+    "MOW": "SVO",  # Moskau -> Sheremetyevo
+    "BAK": "GYD",  # Baku -> Heydar Aliyev
+    "REK": "KEF",  # Reykjavik -> Keflavik
+    "BUH": "OTP",  # Bukarest -> Otopeni
+    "TCI": "TFS",  # Teneriffa -> Süd
+}
+
+
+def normalize_airport_iata(code: str) -> str:
+    """Normalisiert Stadt-/Metro-Codes (z.B. PAR -> CDG, ROM -> FCO) auf echte Flughafen-IATA-Codes."""
+    cleaned = (code or "").strip().upper()
+    return METRO_TO_PRIMARY_AIRPORT.get(cleaned, cleaned)
+
+
+def ensure_valid_future_dates(
+    out_date: str,
+    ret_date: str,
+    reference_date: date | None = None,
+    min_lead_days: int = 2,
+    shift_min_lead_days: int = 14,
+    default_trip_days: int = 12,
+) -> tuple[str, str]:
+    """
+    Stellt sicher, dass Hin- und Rückflugdatum gültig und in der Zukunft liegen.
+    Liegt das Hinflugdatum in der Vergangenheit (oder zu kurzfristig für eine -1-Tag-Positionierung),
+    wird es in vollen 7-Tage-Schritten (Wochentag bleibt erhalten!) in die Zukunft verschoben.
+    """
+    today = reference_date or datetime.now().date()
+    parsed_out: date | None = None
+    parsed_ret: date | None = None
+
+    try:
+        parsed_out = datetime.strptime((out_date or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        parsed_out = None
+
+    try:
+        parsed_ret = datetime.strptime((ret_date or "").strip(), "%Y-%m-%d").date()
+    except ValueError:
+        parsed_ret = None
+
+    trip_days = default_trip_days
+    if parsed_out and parsed_ret:
+        diff = (parsed_ret - parsed_out).days
+        if 1 <= diff <= 90:
+            trip_days = diff
+
+    if parsed_out is None:
+        parsed_out = today + timedelta(days=21)
+        parsed_ret = parsed_out + timedelta(days=trip_days)
+    elif parsed_out < today + timedelta(days=min_lead_days):
+        target_min = today + timedelta(days=shift_min_lead_days)
+        days_needed = (target_min - parsed_out).days
+        weeks_to_add = (days_needed + 6) // 7
+        parsed_out = parsed_out + timedelta(days=weeks_to_add * 7)
+        parsed_ret = parsed_out + timedelta(days=trip_days)
+    elif parsed_ret is None or parsed_ret <= parsed_out:
+        parsed_ret = parsed_out + timedelta(days=trip_days)
+
+    return parsed_out.strftime("%Y-%m-%d"), parsed_ret.strftime("%Y-%m-%d")
+
+
+def build_gf_main_url(deal: FlightDealEvaluation, reference_date: date | None = None) -> str:
+    origin = normalize_airport_iata(deal.iata_origin)
+    dest = normalize_airport_iata(deal.iata_destination)
+    return_dest = (
+        normalize_airport_iata(deal.iata_return_end) if (deal.is_open_jaw and deal.iata_return_end) else origin
+    )
+    is_multi = deal.is_open_jaw and return_dest != origin
+    out_date, ret_date = ensure_valid_future_dates(
+        deal.sample_outbound_date, deal.sample_return_date, reference_date=reference_date
+    )
+
     try:
         info = flights_pb2.Info()
-        return_dest = deal.iata_return_end if (deal.is_open_jaw and deal.iata_return_end) else deal.iata_origin
-        is_multi = deal.is_open_jaw and return_dest != deal.iata_origin
 
         airline_code = deal.primary_airline_iata.strip().upper() if deal.primary_airline_iata else ""
         if not airline_code and deal.airline_names:
@@ -1367,45 +1469,50 @@ def build_gf_main_url(deal: FlightDealEvaluation) -> str:
                 airline_code = m.group(1).upper()
 
         fd1 = info.data.add()
-        fd1.date = deal.sample_outbound_date
-        fd1.from_airport.airport = deal.iata_origin
-        fd1.to_airport.airport = deal.iata_destination
+        fd1.date = out_date
+        fd1.from_airport.airport = origin
+        fd1.to_airport.airport = dest
         if airline_code and len(airline_code) == 2:
             fd1.airlines.append(airline_code)
 
         fd2 = info.data.add()
-        fd2.date = deal.sample_return_date
-        fd2.from_airport.airport = deal.iata_destination
+        fd2.date = ret_date
+        fd2.from_airport.airport = dest
         fd2.to_airport.airport = return_dest
         if airline_code and len(airline_code) == 2:
             fd2.airlines.append(airline_code)
 
-        info.seat = 3  # Business
+        info.seat = 4 if deal.detected_cabin_class == "First Class" else 3  # 4 = First, 3 = Business
         info.trip = 3 if is_multi else 1  # 3 = Multi-city, 1 = Round-trip
         info.passengers.append(1)
 
-        tfs = base64.b64encode(info.SerializeToString()).decode("utf-8")
+        tfs = urllib.parse.quote(base64.b64encode(info.SerializeToString()).decode("utf-8"), safe="")
         return f"https://www.google.com/travel/flights/search?tfs={tfs}&hl=de&curr=EUR"
     except Exception as e:
         logging.warning(f"Fallback bei Google Flights Hauptflug-Link: {e}")
         airline_str = f" with {deal.primary_airline_iata}" if deal.primary_airline_iata else ""
-        if deal.is_open_jaw and deal.iata_return_end and deal.iata_return_end != deal.iata_origin:
-            query = f"Multi-city flights from {deal.iata_origin} to {deal.iata_destination} on {deal.sample_outbound_date} and from {deal.iata_destination} to {deal.iata_return_end} on {deal.sample_return_date}{airline_str} business class"
+        cabin_str = "first class" if deal.detected_cabin_class == "First Class" else "business class"
+        if is_multi:
+            query = f"Multi-city flights from {origin} to {dest} on {out_date} and from {dest} to {return_dest} on {ret_date}{airline_str} {cabin_str}"
         else:
-            query = f"Round trip flights from {deal.iata_origin} to {deal.iata_destination} on {deal.sample_outbound_date} returning {deal.sample_return_date}{airline_str} business class"
+            query = f"Round trip flights from {origin} to {dest} on {out_date} returning {ret_date}{airline_str} {cabin_str}"
         return f"https://www.google.com/travel/flights?hl=en&gl=de&curr=EUR&q={urllib.parse.quote_plus(query)}"
 
 
-def build_positioning_url(origin: str, out_date: str, ret_date: str, home: str | None = None) -> str:
-    home_hub = home or HOME_AIRPORT
+def build_positioning_url(
+    origin: str, out_date: str, ret_date: str, home: str | None = None, reference_date: date | None = None
+) -> str:
+    home_hub = normalize_airport_iata(home or HOME_AIRPORT)
+    origin_code = normalize_airport_iata(origin)
+    safe_out, safe_ret = ensure_valid_future_dates(out_date, ret_date, reference_date=reference_date)
     try:
-        pos_out = (datetime.strptime(out_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-        pos_ret = (datetime.strptime(ret_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        pos_out = (datetime.strptime(safe_out, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        pos_ret = (datetime.strptime(safe_ret, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
 
         q = create_query(
             flights=[
-                FlightQuery(date=pos_out, from_airport=home_hub, to_airport=origin),
-                FlightQuery(date=pos_ret, from_airport=origin, to_airport=home_hub),
+                FlightQuery(date=pos_out, from_airport=home_hub, to_airport=origin_code),
+                FlightQuery(date=pos_ret, from_airport=origin_code, to_airport=home_hub),
             ],
             seat="economy",
             trip="round-trip",
@@ -1413,11 +1520,179 @@ def build_positioning_url(origin: str, out_date: str, ret_date: str, home: str |
             currency="EUR",
             language="de",
         )
-        return q.url()
+        tfs = urllib.parse.quote(q.to_str(), safe="")
+        return f"https://www.google.com/travel/flights/search?tfs={tfs}&hl=de&curr=EUR"
     except Exception as e:
         logging.warning(f"Fallback bei Google Flights Positionierungs-Link: {e}")
-        query = f"Round trip flights from {home_hub} to {origin} on {out_date} returning {ret_date} economy"
+        query = f"Round trip flights from {home_hub} to {origin_code} on {safe_out} returning {safe_ret} economy"
         return f"https://www.google.com/travel/flights?hl=en&gl=de&curr=EUR&q={urllib.parse.quote_plus(query)}"
+
+
+@dataclass
+class GoogleFlightsLiveCheckResult:
+    checked: bool = False
+    main_price_eur: int | None = None
+    main_outbound_date: str = ""
+    main_return_date: str = ""
+    price_matches_deal: bool = False
+    positioning_price_eur: int | None = None
+    positioning_origin: str = ""
+    positioning_destination: str = ""
+    error: str = ""
+
+
+_GF_CONSENT_COOKIES = {
+    "SOCS": "CAESHAgBEhJnd3NfMjAyMzA4MTAtMF9SQzIaAmRlIAEaBgiAo_CmBg",
+}
+
+
+def _build_gf_main_query(deal: FlightDealEvaluation, out_date: str, ret_date: str) -> Query:
+    origin = normalize_airport_iata(deal.iata_origin)
+    dest = normalize_airport_iata(deal.iata_destination)
+    return_dest = (
+        normalize_airport_iata(deal.iata_return_end) if (deal.is_open_jaw and deal.iata_return_end) else origin
+    )
+    is_multi = deal.is_open_jaw and return_dest != origin
+
+    airline_code = deal.primary_airline_iata.strip().upper() if deal.primary_airline_iata else ""
+    if not airline_code and deal.airline_names:
+        m = re.search(r"\b([A-Z0-9]{2})\b", deal.airline_names)
+        if m:
+            airline_code = m.group(1).upper()
+    airlines_filter = [airline_code] if (airline_code and len(airline_code) == 2) else None
+
+    seat_type: Literal["business", "first"] = "first" if deal.detected_cabin_class == "First Class" else "business"
+    trip_type: Literal["round-trip", "multi-city"] = "multi-city" if is_multi else "round-trip"
+
+    return create_query(
+        flights=[
+            FlightQuery(date=out_date, from_airport=origin, to_airport=dest, airlines=airlines_filter),
+            FlightQuery(date=ret_date, from_airport=dest, to_airport=return_dest, airlines=airlines_filter),
+        ],
+        seat=seat_type,
+        trip=trip_type,
+        passengers=Passengers(adults=1),
+        currency="EUR",
+        language="de",
+    )
+
+
+def _build_gf_positioning_query(origin: str, out_date: str, ret_date: str, home: str | None = None) -> Query:
+    home_hub = normalize_airport_iata(home or HOME_AIRPORT)
+    origin_code = normalize_airport_iata(origin)
+    pos_out = (datetime.strptime(out_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+    pos_ret = (datetime.strptime(ret_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    return create_query(
+        flights=[
+            FlightQuery(date=pos_out, from_airport=home_hub, to_airport=origin_code),
+            FlightQuery(date=pos_ret, from_airport=origin_code, to_airport=home_hub),
+        ],
+        seat="economy",
+        trip="round-trip",
+        passengers=Passengers(adults=1),
+        currency="EUR",
+        language="de",
+    )
+
+
+def fetch_gf_lowest_price_eur(query: Query, timeout_seconds: int = GF_LIVE_CHECK_TIMEOUT_SECONDS) -> int | None:
+    """Fragt Google Flights mit striktem Timeout und EU-Consent-Cookie ab und gibt den günstigsten Preis in EUR zurück (Fail-Open)."""
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(
+            "https://www.google.com/travel/flights/search",
+            params=query.params(),
+            impersonate="chrome124",
+            timeout=timeout_seconds,
+            cookies=_GF_CONSENT_COOKIES,
+        )
+        if resp.status_code != 200 or not resp.text:
+            logging.info("Google Flights Live-Check lieferte HTTP %s", resp.status_code)
+            return None
+
+        results = parse_gf_html(resp.text)
+        prices = [f.price for f in results if isinstance(getattr(f, "price", None), int) and f.price > 0]
+        return min(prices) if prices else None
+    except Exception as exc:
+        logging.info("Google Flights Live-Check fehlgeschlagen (Fail-Open): %s", exc)
+        return None
+
+
+def run_google_flights_live_check(
+    deal: FlightDealEvaluation,
+    home: str | None = None,
+    reference_date: date | None = None,
+    price_fetcher: Callable[[Query], int | None] | None = None,
+) -> GoogleFlightsLiveCheckResult:
+    """
+    Soft Live-Check auf Google Flights (100% Fail-Open):
+    1. Prüft bis zu 3 wochentagserhaltende Terminpaare (+0, +14, +28 Tage) für den Hauptflug.
+       Wird ein besserer / bestätigter Termin gefunden, werden sample_outbound_date & sample_return_date
+       direkt am Deal aktualisiert, damit alle Links auf den bestätigten Termin zeigen.
+    2. Prüft bei Ex-EU-Deals zusätzlich den günstigsten Live-Preis für den Positionierungsflug ab HOME_AIRPORT.
+    """
+    fetcher = price_fetcher or fetch_gf_lowest_price_eur
+    home_hub = normalize_airport_iata(home or HOME_AIRPORT)
+    origin = normalize_airport_iata(deal.iata_origin)
+    base_out, base_ret = ensure_valid_future_dates(
+        deal.sample_outbound_date, deal.sample_return_date, reference_date=reference_date
+    )
+
+    result = GoogleFlightsLiveCheckResult(
+        checked=True,
+        main_outbound_date=base_out,
+        main_return_date=base_ret,
+    )
+
+    # Toleranzschwelle für bestätigten Deal-Preis (+15 % bzw. mind. +150 € wegen OTA- vs. Direktpreis-Differenz)
+    max_match_price = max(int(deal.price_eur * 1.15), deal.price_eur + 150) if deal.price_eur > 0 else 0
+
+    base_out_dt = datetime.strptime(base_out, "%Y-%m-%d").date()
+    base_ret_dt = datetime.strptime(base_ret, "%Y-%m-%d").date()
+
+    best_price: int | None = None
+    best_out = base_out
+    best_ret = base_ret
+
+    try:
+        for offset_days in (0, 14, 28):
+            cand_out = (base_out_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+            cand_ret = (base_ret_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+            q_main = _build_gf_main_query(deal, cand_out, cand_ret)
+            price = fetcher(q_main)
+            if price is not None and (best_price is None or price < best_price):
+                best_price = price
+                best_out = cand_out
+                best_ret = cand_ret
+            if price is not None and (max_match_price <= 0 or price <= max_match_price):
+                break
+
+        if best_price is not None:
+            result.main_price_eur = best_price
+            result.main_outbound_date = best_out
+            result.main_return_date = best_ret
+            result.price_matches_deal = max_match_price <= 0 or best_price <= max_match_price
+            # Übernehme den günstigsten gefundenen Termin direkt auf den Deal für Haupt- & Positionierungslink
+            deal.sample_outbound_date = best_out
+            deal.sample_return_date = best_ret
+    except Exception as exc:
+        result.error = str(exc)
+        logging.info("Hauptflug Live-Check abgebrochen (Fail-Open): %s", exc)
+
+    # Optionaler Positionierungsflug (nur bei Ex-EU Abflug außerhalb der bevorzugten Hubs)
+    if origin and origin not in PREFERRED_HUBS and origin != home_hub:
+        result.positioning_origin = home_hub
+        result.positioning_destination = origin
+        try:
+            q_pos = _build_gf_positioning_query(
+                origin, result.main_outbound_date, result.main_return_date, home=home_hub
+            )
+            result.positioning_price_eur = fetcher(q_pos)
+        except Exception as exc:
+            logging.info("Positionierungsflug Live-Check abgebrochen (Fail-Open): %s", exc)
+
+    return result
 
 
 def generate_with_gemini_fallback(
@@ -1642,10 +1917,9 @@ STRIKTE REGELN FÜR 'is_relevant = True':
    - Nenne HIER nur echte operative Zusatzfakten aus dem Text: weitere buchbare Abflughäfen, außergewöhnlich lange Layover (> 8h), Flughafenwechsel oder Tarifregeln (Stopover/Mindestaufenthalt).
    - WICHTIG & STRENG VERBOTEN: Wiederhole NIEMALS Meilen, 0 Points/QP, Allianzen, Positionierungshinweise (24h-Puffer) oder generische Preis-Checks / Buchungstipps (wie 'OTA-Bestpreis vs. Direktbuchung', Momondo/Kayak/Skyscanner, Zahlungsaufschläge, Phantom-Verfügbarkeit)!
    - Wenn keine solchen echten Besonderheiten im Artikel stehen: Setze routing_advice = "".
-7. Reisedaten & Airline-Code:
-   - WICHTIG: Nutze ZWINGEND die im Text oder Buchungslink genannten Beispieldaten (Hinflug / Rückflug), da Airlines oft nur an bestimmten Wochentagen fliegen (z.B. nur Mo/Mi/Sa)!
-   - Falls mehrere Termine im Link/Text vorkommen, nimm das erste konkrete Beispieldatum im Format YYYY-MM-DD.
-   - Nur wenn absolut kein konkretes Datum im Artikel oder Link genannt ist, wähle ein plausibles Datum im Reisezeitraum.
+7. Reisedaten, Flughafen-Codes & Airline-Code:
+   - WICHTIG FLUGHAFEN-CODES: Nutze für 'iata_origin', 'iata_destination' und 'iata_return_end' ZWINGEND echte 3-Letter Flughafen-Codes (z.B. 'CDG' statt 'PAR', 'FCO' statt 'ROM', 'LHR' statt 'LON', 'MXP' statt 'MIL', 'ARN' statt 'STO', 'HND'/'NRT' statt 'TYO', 'CGK' statt 'JKT') – NIEMALS Stadt-/Metro-Sammelcodes!
+   - WICHTIG REISEDATEN: Nutze die im Text oder Buchungslink genannten Beispieldaten (Hinflug / Rückflug), SOFERN sie in der Zukunft liegen (mindestens 14 Tage nach dem aktuellen Datum!). Liegt das genannte Beispieldatum in der Vergangenheit oder ist keines genannt, wähle ein plausibles ZUKÜNFTIGES Datum im genannten Reisezeitraum (Format YYYY-MM-DD).
    - Setze 'primary_airline_iata' zwingend auf den 2-Letter Code der ausführenden Hauptairline (z.B. 'LO' für LOT Polish Airlines, 'LX', 'OS', 'LH', 'QR', 'EY', 'TK', 'RJ', 'UX') für den automatischen Google-Flights-Filter.
 8. Ignorierte Airlines: Flüge von folgenden Airlines sind STRIKT IRRELEVANT (is_relevant = False, deal_category = 'Irrelevant') und dürfen NIEMALS als Angebot angezeigt werden: {ignored_airlines_str}. Setze in diesem Fall 'rejection_reason = Airline ignoriert (Name/Code)'.
 9. Ablehnungsgrund ('rejection_reason'):
@@ -1666,6 +1940,12 @@ Inhalt: {clean_text[:5000]}
         raise ValueError("Gemini lieferte eine leere strukturierte Antwort (response.parsed ist None).")
 
     deal = response.parsed
+    deal.iata_origin = normalize_airport_iata(deal.iata_origin)
+    deal.iata_destination = normalize_airport_iata(deal.iata_destination)
+    deal.iata_return_end = normalize_airport_iata(deal.iata_return_end)
+    deal.sample_outbound_date, deal.sample_return_date = ensure_valid_future_dates(
+        deal.sample_outbound_date, deal.sample_return_date
+    )
     deal = normalize_and_verify_deal_mm_points(deal)
     deal.iata_via = resolve_deal_stops(deal)
     is_ignored, ignored_air = is_deal_ignored_airline(deal, ignored_airlines)
@@ -1678,26 +1958,47 @@ Inhalt: {clean_text[:5000]}
     return deal
 
 
+def _format_short_date_range(out_date: str, ret_date: str) -> str:
+    try:
+        o = datetime.strptime(out_date, "%Y-%m-%d").strftime("%d.%m.")
+        r = datetime.strptime(ret_date, "%Y-%m-%d").strftime("%d.%m.")
+        return f"{o}–{r}"
+    except ValueError:
+        return f"{out_date}–{ret_date}"
+
+
 def build_telegram_message(
-    deal: FlightDealEvaluation, title: str, url: str, sample_booking: str = "", prev_price: int = 0
+    deal: FlightDealEvaluation,
+    title: str,
+    url: str,
+    sample_booking: str = "",
+    prev_price: int = 0,
+    live_check: GoogleFlightsLiveCheckResult | None = None,
 ) -> str:
+    origin_code = normalize_airport_iata(deal.iata_origin)
+    dest_code = normalize_airport_iata(deal.iata_destination)
     gf_main = build_gf_main_url(deal)
     pos_line = ""
-    if deal.iata_origin not in PREFERRED_HUBS:
+    if origin_code not in PREFERRED_HUBS:
         gf_pos = build_positioning_url(
-            deal.iata_origin, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
+            origin_code, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
         )
-        pos_line = f'\n🔹 <a href="{gf_pos}">Positionierung: {html.escape(HOME_AIRPORT)}–{html.escape(deal.iata_origin)} (+/- 24h Stopover)</a>'
+        pos_price_suffix = (
+            f", ab ~{live_check.positioning_price_eur} €"
+            if (live_check and live_check.positioning_price_eur is not None)
+            else ""
+        )
+        pos_line = f'\n🔹 <a href="{gf_pos}">Positionierung: {html.escape(HOME_AIRPORT)}–{html.escape(origin_code)} (+/- 24h Stopover{pos_price_suffix})</a>'
 
     booking_line = ""
     if sample_booking and sample_booking.startswith("http"):
         booking_line = f'\n🔹 <a href="{html.escape(sample_booking, quote=True)}">Geprüftes Buchungsbeispiel (Skyscanner / OTA)</a>'
 
     stops = resolve_deal_stops(deal)
-    route_nodes = [deal.iata_origin, *stops, deal.iata_destination]
+    route_nodes = [origin_code, *stops, dest_code]
     route_str = " ➔ ".join(f"<code>{html.escape(node)}</code>" for node in route_nodes if node)
     if deal.is_open_jaw and deal.iata_return_end and deal.iata_return_end != deal.iata_origin:
-        route_str += f" ➔ <code>{html.escape(deal.iata_return_end)}</code> (Gabelflug)"
+        route_str += f" ➔ <code>{html.escape(normalize_airport_iata(deal.iata_return_end))}</code> (Gabelflug)"
 
     ftl_info = ""
     if deal.mm_points > 0:
@@ -1706,6 +2007,22 @@ def build_telegram_message(
         ftl_info = f" (FTL-Ziel: ~{pct_p}% Points / ~{pct_qp}% QP)"
 
     airline_label = f" ({html.escape(deal.primary_airline_iata)})" if deal.primary_airline_iata else ""
+
+    live_check_line = ""
+    if live_check and live_check.main_price_eur is not None:
+        date_range = _format_short_date_range(
+            live_check.main_outbound_date or deal.sample_outbound_date,
+            live_check.main_return_date or deal.sample_return_date,
+        )
+        if live_check.price_matches_deal:
+            live_check_line = (
+                f"• <b>Google Flights Live-Check:</b> ✅ ab ~{live_check.main_price_eur} € bestätigt ({date_range})\n"
+            )
+        else:
+            live_check_line = (
+                f"• <b>Google Flights Live-Check:</b> ⚠️ am Beispieltermin ab ~{live_check.main_price_eur} € "
+                f"({date_range} – andere Daten/OTA prüfen)\n"
+            )
 
     # Besonderheiten (routing_advice) konditional & mit Sicherheitsfilter (Meilen, Allianzen & generische Boilerplate) einbinden
     advice_line = ""
@@ -1741,17 +2058,20 @@ def build_telegram_message(
             f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
         )
 
+    cabin_link_label = "First" if deal.detected_cabin_class == "First Class" else "Business"
+
     msg = (
         f"{header_line}\n\n"
         f"<b>{html.escape(title)}</b>\n\n"
         f"• <b>Route:</b> {route_str} ({html.escape(deal.airline_names)})\n"
         f"{price_line}\n"
+        f"{live_check_line}"
         f"• <b>Miles & More:</b> {deal.mm_points} Points | <b>{deal.mm_qualifying_points} QP</b>{ftl_info}\n"
         f"• <b>Bordprodukt:</b> {html.escape(deal.cabin_assessment)}\n"
         f"{advice_line}\n"
         f"🔗 <b>Direktlinks:</b>\n"
         f'🔹 <a href="{html.escape(url, quote=True)}">Deal-Quelle & Tarifdetails</a>\n'
-        f'🔹 <a href="{gf_main}">Google Flights: {html.escape(deal.iata_origin)}–{html.escape(deal.iata_destination)}{airline_label} (Business)</a>'
+        f'🔹 <a href="{gf_main}">Google Flights: {html.escape(origin_code)}–{html.escape(dest_code)}{airline_label} ({cabin_link_label})</a>'
         f"{pos_line}"
         f"{booking_line}"
     )
@@ -1765,8 +2085,9 @@ def send_telegram(
     sample_booking: str = "",
     session: requests.Session | None = None,
     prev_price: int = 0,
+    live_check: GoogleFlightsLiveCheckResult | None = None,
 ):
-    msg = build_telegram_message(deal, title, url, sample_booking, prev_price=prev_price)
+    msg = build_telegram_message(deal, title, url, sample_booking, prev_price=prev_price, live_check=live_check)
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     s = session or SESSION
     for attempt in range(3):
@@ -2114,7 +2435,19 @@ def main():
                         fingerprint = build_deal_fingerprint(deal)
 
                         if should_send:
-                            send_telegram(deal, title, raw_link, sample_booking, prev_price=prev_price)
+                            live_check = None
+                            if ENABLE_GF_LIVE_CHECK:
+                                watchdog.beat(update_file=True)
+                                live_check = run_google_flights_live_check(deal, home=HOME_AIRPORT)
+                                watchdog.beat(update_file=True)
+                            send_telegram(
+                                deal,
+                                title,
+                                raw_link,
+                                sample_booking,
+                                prev_price=prev_price,
+                                live_check=live_check,
+                            )
                             record_sent_deal(conn, deal)
                             if send_reason == "price_drop":
                                 logging.info(

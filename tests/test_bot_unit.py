@@ -1,10 +1,14 @@
+import base64
 import os
 import tempfile
 import threading
 import time
+import urllib.parse
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import requests
+from fast_flights.pb import flights_pb2
 from google.genai import types
 
 from bot import (
@@ -12,6 +16,7 @@ from bot import (
     IGNORED_AIRLINES,
     ActivityWatchdog,
     FlightDealEvaluation,
+    GoogleFlightsLiveCheckResult,
     build_gf_main_url,
     build_positioning_url,
     build_telegram_message,
@@ -20,6 +25,7 @@ from bot import (
     cleanup_db,
     close_db,
     create_genai_client,
+    ensure_valid_future_dates,
     evaluate_with_gemini,
     format_deal_route_plain,
     generate_with_gemini_fallback,
@@ -28,12 +34,14 @@ from bot import (
     is_deal_ignored_airline,
     is_feed_entry_eligible_pre_filter,
     main,
+    normalize_airport_iata,
     normalize_and_verify_deal_mm_points,
     normalize_iata_via,
     normalize_url,
     record_sent_deal,
     resolve_deal_category,
     resolve_deal_stops,
+    run_google_flights_live_check,
     should_send_deal,
     should_trip_circuit_breaker,
     validate_deal_safety,
@@ -868,3 +876,177 @@ def test_central_asia_region_integration():
     assert "Australien / Ozeanien" in captured_prompts[0]
     assert "max. 2400 EUR Return" in captured_prompts[0]
     assert "max. 1900 EUR Return (bis 1950 EUR" in captured_prompts[0]
+
+
+def test_google_flights_url_sanitizes_metro_codes_and_past_dates():
+    # 1. Metro-Codes werden auf echte Hauptflughäfen gemappt, echte Flughäfen bleiben unverändert
+    assert normalize_airport_iata("PAR") == "CDG"
+    assert normalize_airport_iata("ROM") == "FCO"
+    assert normalize_airport_iata("LON") == "LHR"
+    assert normalize_airport_iata("TYO") == "HND"
+    assert normalize_airport_iata("JKT") == "CGK"
+    assert normalize_airport_iata("CDG") == "CDG"
+    assert normalize_airport_iata("ORY") == "ORY"
+    assert normalize_airport_iata("SHA") == "SHA"
+
+    # 2. Vergangene Daten (wie PAR->CMB am 2026-11-24 bei Stichtag 2026-11-27) werden wochentagserhaltend in die Zukunft geschoben
+    ref_today = date(2026, 11, 27)
+    out_fixed, ret_fixed = ensure_valid_future_dates("2026-11-24", "2026-12-08", reference_date=ref_today)
+    assert out_fixed == "2026-12-15"  # +3 Wochen (bleibt Dienstag!) und >= +14 Tage ab 2026-11-27
+    assert ret_fixed == "2026-12-29"  # Reisedauer 14 Tage bleibt exakt erhalten
+
+    # Bereits in der Zukunft liegende Daten bleiben unverändert
+    assert ensure_valid_future_dates("2027-02-10", "2027-02-24", reference_date=ref_today) == (
+        "2027-02-10",
+        "2027-02-24",
+    )
+
+    # 3. Exakter Regressionsfall: Paris (PAR) -> Colombo (CMB) mit Etihad (EY) und vergangenem Datum
+    deal_par_cmb = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Paris -> Colombo Business Class Round Trip 1430€",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt",
+        airline_names="Etihad Airways (EY)",
+        primary_airline_iata="EY",
+        iata_origin="PAR",
+        iata_via=["AUH"],
+        iata_destination="CMB",
+        is_open_jaw=False,
+        iata_return_end="PAR",
+        region="Asien",
+        sample_outbound_date="2026-11-24",
+        sample_return_date="2026-12-08",
+        price_eur=1430,
+        booking_class="Nicht genannt",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="Fully lie-flat Business Class seats",
+        routing_advice="Minimum stay 4 days, maximum stay 3 months.",
+        rejection_reason="",
+    )
+
+    gf_url = build_gf_main_url(deal_par_cmb, reference_date=ref_today)
+    parsed = urllib.parse.urlsplit(gf_url)
+    tfs_param = urllib.parse.parse_qs(parsed.query)["tfs"][0]
+    info = flights_pb2.Info()
+    info.ParseFromString(base64.b64decode(tfs_param))
+
+    assert info.data[0].from_airport.airport == "CDG"
+    assert info.data[0].to_airport.airport == "CMB"
+    assert list(info.data[0].airlines) == ["EY"]
+    assert info.data[0].date == "2026-12-15"
+    assert info.data[1].from_airport.airport == "CMB"
+    assert info.data[1].to_airport.airport == "CDG"
+    assert info.data[1].date == "2026-12-29"
+    assert info.seat == 3
+
+    # 4. Positionierungs-Link HAM -> PAR wird ebenfalls auf CDG & Zukunftsdaten normalisiert
+    pos_url = build_positioning_url("PAR", "2026-11-24", "2026-12-08", home="HAM", reference_date=ref_today)
+    pos_parsed = urllib.parse.urlsplit(pos_url)
+    pos_tfs = urllib.parse.parse_qs(pos_parsed.query)["tfs"][0]
+    pos_info = flights_pb2.Info()
+    pos_info.ParseFromString(base64.b64decode(pos_tfs))
+
+    assert pos_info.data[0].from_airport.airport == "HAM"
+    assert pos_info.data[0].to_airport.airport == "CDG"
+    assert pos_info.data[0].date == "2026-12-14"
+    assert pos_info.data[1].from_airport.airport == "CDG"
+    assert pos_info.data[1].to_airport.airport == "HAM"
+    assert pos_info.data[1].date == "2026-12-30"
+
+
+def test_google_flights_live_check_and_positioning_price():
+    ref_today = date(2026, 11, 27)
+    deal = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Paris -> Colombo Business Class Round Trip 1430€",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt",
+        airline_names="Etihad Airways (EY)",
+        primary_airline_iata="EY",
+        iata_origin="PAR",
+        iata_via=["AUH"],
+        iata_destination="CMB",
+        is_open_jaw=False,
+        iata_return_end="PAR",
+        region="Asien",
+        sample_outbound_date="2026-11-24",
+        sample_return_date="2026-12-08",
+        price_eur=1430,
+        booking_class="Nicht genannt",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="Fully lie-flat Business Class seats",
+        routing_advice="",
+        rejection_reason="",
+    )
+
+    # 1. Erster Termin (15.12.) ist zu teuer (2450€), zweiter (+14 Tage = 29.12.) bestätigt 1448€, Positionierung HAM->CDG kostet 138€
+    seen_queries: list[tuple[str, str, str, str]] = []
+
+    def fake_fetcher(q):
+        fd0 = q.flight_data[0]
+        key = (fd0.from_airport.airport, fd0.to_airport.airport, fd0.date, q.get_seat_type())
+        seen_queries.append(key)
+        if key == ("CDG", "CMB", "2026-12-15", "business"):
+            return 2450
+        if key == ("CDG", "CMB", "2026-12-29", "business"):
+            return 1448
+        if key == ("HAM", "CDG", "2026-12-28", "economy"):
+            return 138
+        return None
+
+    live = run_google_flights_live_check(deal, home="HAM", reference_date=ref_today, price_fetcher=fake_fetcher)
+    assert live.checked is True
+    assert live.main_price_eur == 1448
+    assert live.price_matches_deal is True
+    assert live.main_outbound_date == "2026-12-29"
+    assert live.main_return_date == "2027-01-12"
+    assert live.positioning_price_eur == 138
+    assert deal.sample_outbound_date == "2026-12-29"
+    assert deal.sample_return_date == "2027-01-12"
+    # Nach Treffer am 2. Termin wird der 3. Termin (+28 Tage) nicht mehr unnötig abgefragt
+    assert len(seen_queries) == 3
+
+    msg_ok = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live)
+    assert "• <b>Google Flights Live-Check:</b> ✅ ab ~1448 € bestätigt (29.12.–12.01.)" in msg_ok
+    assert "Positionierung: HAM–CDG (+/- 24h Stopover, ab ~138 €)" in msg_ok
+
+    # 2. Warn-Badge wenn Live-Preis deutlich über Deal-Preis liegt
+    live_warn = GoogleFlightsLiveCheckResult(
+        checked=True,
+        main_price_eur=2180,
+        main_outbound_date="2026-12-15",
+        main_return_date="2026-12-29",
+        price_matches_deal=False,
+        positioning_price_eur=None,
+    )
+    msg_warn = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live_warn)
+    assert "⚠️ am Beispieltermin ab ~2180 €" in msg_warn
+    assert "Positionierung: HAM–CDG (+/- 24h Stopover)" in msg_warn
+
+    # 3. Fail-Open bei Google-Blockade / Exception -> kein Crash, keine Live-Check-Zeile
+    def failing_fetcher(_q):
+        raise RuntimeError("Consent wall / blocked")
+
+    live_fail = run_google_flights_live_check(
+        deal.model_copy(), home="HAM", reference_date=ref_today, price_fetcher=failing_fetcher
+    )
+    assert live_fail.main_price_eur is None
+    assert live_fail.positioning_price_eur is None
+    msg_fail = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live_fail)
+    assert "Google Flights Live-Check" not in msg_fail
+
+    # 4. Bei bevorzugtem Hub (FRA) wird kein Positionierungsflug abgefragt
+    deal_fra = deal.model_copy(update={"iata_origin": "FRA", "iata_return_end": "FRA"})
+    pos_calls: list[str] = []
+
+    def hub_fetcher(q):
+        pos_calls.append(q.get_seat_type())
+        return 1450
+
+    live_fra = run_google_flights_live_check(deal_fra, home="HAM", reference_date=ref_today, price_fetcher=hub_fetcher)
+    assert live_fra.main_price_eur == 1450
+    assert live_fra.positioning_price_eur is None
+    assert pos_calls == ["business"]
