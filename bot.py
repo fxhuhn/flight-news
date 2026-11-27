@@ -375,6 +375,9 @@ HARD_NEGATIVE_KEYWORDS = [
     "abgelaufen",
     "hotel",
     "kreditkarte",
+    "credit card",
+    "credit-card",
+    "willkommensbonus",
     "girokonto",
     "festgeld",
     "tagesgeld",
@@ -460,7 +463,12 @@ def is_feed_entry_eligible_pre_filter(
 
 
 def _make_iata_via_required(schema: dict[str, Any]) -> None:
-    """Stellt sicher, dass Gemini Structured Outputs 'iata_via', 'additional_destinations' und 'is_origin_in_europe' immer aktiv befüllt."""
+    """Stellt sicher, dass Gemini Structured Outputs optionale Python-Felder aktiv befüllt und entfernt 'default'-Keys (Gemini API lehnt 'default' im Schema ab)."""
+    props = schema.get("properties")
+    if isinstance(props, dict):
+        for prop_schema in props.values():
+            if isinstance(prop_schema, dict):
+                prop_schema.pop("default", None)
     req = schema.setdefault("required", [])
     if isinstance(req, list):
         for field_name in ("iata_via", "additional_destinations", "is_origin_in_europe"):
@@ -529,7 +537,7 @@ class FlightDealEvaluation(BaseModel):
         )
     )
     is_origin_in_europe: bool = Field(
-        default=True,
+        default_factory=lambda: True,
         description=(
             "True, wenn iata_origin geografisch in Europa liegt (inkl. EU, UK, Schweiz, Norwegen, Island, Balkan, Türkei/IST). "
             "Zwingend False bei Abflug außerhalb Europas (z.B. Kairo CAI, Tunis TUN, Casablanca CMN, Peking PEK, Hongkong HKG, "

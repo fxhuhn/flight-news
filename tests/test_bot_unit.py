@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 from fast_flights.pb import flights_pb2
-from google.genai import _extra_utils, types
+from google.genai import _extra_utils, _transformers, types
 
 from bot import (
     CONFIG,
@@ -1410,6 +1410,14 @@ def test_url_path_segment_pre_filter_and_newsletter_normalization():
 
 
 def test_afc_config_emits_no_sdk_warning(caplog):
+    # 1. Echtes Gemini-API-Schema-Transform prüfen (fängt 'Default value is not supported in the response schema' ohne Mock ab!)
+    client = create_genai_client(api_key="dummy-key")
+    transformed_schema = _transformers.t_schema(client._api_client, FlightDealEvaluation)
+    assert "is_origin_in_europe" in transformed_schema.required
+    assert "iata_via" in transformed_schema.required
+    assert "additional_destinations" in transformed_schema.required
+
+    # 2. Keine AFC-SDK-Warnung beim Bauen der GenerateContentConfig
     with caplog.at_level(logging.WARNING):
         cfg = types.GenerateContentConfig(
             temperature=0.1,
