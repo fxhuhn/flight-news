@@ -1,15 +1,17 @@
 import base64
+import logging
 import os
+import sqlite3
 import tempfile
 import threading
 import time
 import urllib.parse
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import requests
 from fast_flights.pb import flights_pb2
-from google.genai import types
+from google.genai import _extra_utils, types
 
 from bot import (
     CONFIG,
@@ -27,6 +29,7 @@ from bot import (
     create_genai_client,
     ensure_valid_future_dates,
     evaluate_with_gemini,
+    extract_entry_published_utc,
     format_deal_route_plain,
     generate_with_gemini_fallback,
     init_db,
@@ -34,6 +37,7 @@ from bot import (
     is_deal_ignored_airline,
     is_feed_entry_eligible_pre_filter,
     main,
+    normalize_additional_destinations,
     normalize_airport_iata,
     normalize_and_verify_deal_mm_points,
     normalize_iata_via,
@@ -42,8 +46,10 @@ from bot import (
     resolve_deal_category,
     resolve_deal_stops,
     run_google_flights_live_check,
+    should_evaluate_url,
     should_send_deal,
     should_trip_circuit_breaker,
+    upsert_seen_url,
     validate_deal_safety,
     wait_for_next_cycle,
 )
@@ -799,13 +805,15 @@ def test_wal_checkpoint_cleanup_and_cycle_close():
 
 
 def test_central_asia_region_integration():
-    # 1. Konfiguration enthält Zentralasien standardmäßig & angehobene Preislimits (2400 / 1900 / 1950)
+    # 1. Konfiguration enthält Zentralasien standardmäßig, preferred_hubs ohne CPH & Option-A-Preislimits (2600 / 2000)
+    assert CONFIG["origin"]["preferred_hubs"] == ["HAM", "FRA", "BER"]
     assert "Zentralasien" in CONFIG["destinations"]["regions"]
     assert "Ozeanien" not in CONFIG["destinations"]["regions"]
-    assert {"DWC", "RUH", "MCT", "SLL", "DOH", "AQJ"}.issubset(set(CONFIG["destinations"]["sweet_spots"]))
-    assert CONFIG["pricing"]["max_price_home_hubs"] == 2400
-    assert CONFIG["pricing"]["max_price_ex_eu"] == 1900
-    assert CONFIG["pricing"]["max_price_top_cabin_ex_eu"] == 1950
+    assert {"DWC", "RUH", "MCT", "SLL", "DOH", "AQJ", "TBS", "BUS", "KUT"}.issubset(
+        set(CONFIG["destinations"]["sweet_spots"])
+    )
+    assert CONFIG["pricing"]["max_price_home_hubs"] == 2600
+    assert CONFIG["pricing"]["max_price_ex_eu"] == 2000
 
     # 2. FlightDealEvaluation akzeptiert 'Zentralasien' als eigene Region (z.B. TK FRA -> IST -> NQZ)
     deal_nqz = FlightDealEvaluation(
@@ -874,8 +882,10 @@ def test_central_asia_region_integration():
     assert "Kasachstan" in captured_prompts[0]
     assert "Usbekistan" in captured_prompts[0]
     assert "Australien / Ozeanien" in captured_prompts[0]
-    assert "max. 2400 EUR Return" in captured_prompts[0]
-    assert "max. 1900 EUR Return (bis 1950 EUR" in captured_prompts[0]
+    assert "Bevorzugte Hubs: BER, FRA, HAM)" in captured_prompts[0]
+    assert "max. 2600 EUR Return" in captured_prompts[0]
+    assert "TBS" in captured_prompts[0]
+    assert "max. 2000 EUR Return." in captured_prompts[0]
 
 
 def test_google_flights_url_sanitizes_metro_codes_and_past_dates():
@@ -1050,3 +1060,360 @@ def test_google_flights_live_check_and_positioning_price():
     assert live_fra.main_price_eur == 1450
     assert live_fra.positioning_price_eur is None
     assert pos_calls == ["business"]
+
+
+def test_additional_and_priority_destinations():
+    # 1. Normalisierung entfernt Hauptziel, Duplikate, Platzhalter und kappt auf max. 6 Einträge
+    cleaned = normalize_additional_destinations(
+        [
+            "KUL (~1.820 €)",
+            "BKK (~1.785 €)",
+            "SIN (~1.850 €)",
+            "Kuala Lumpur (KUL)",
+            "none",
+            "-",
+            "MNL (~1.890 €)",
+            "CGK (~1.860 €)",
+            "SGN (~1.870 €)",
+            "HKT (~1.810 €)",
+            "HAN (~1.900 €)",
+            "DPS (~1.920 €)",
+        ],
+        primary_dest="BKK",
+    )
+    assert cleaned == [
+        "KUL (~1.820 €)",
+        "SIN (~1.850 €)",
+        "MNL (~1.890 €)",
+        "CGK (~1.860 €)",
+        "SGN (~1.870 €)",
+        "HKT (~1.810 €)",
+    ]
+
+    # 2. evaluate_with_gemini enthält Wunschziele & Sammel-Deal-Regeln im Prompt und bereinigt additional_destinations
+    deal_kul = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="China Southern Business Class ab Amsterdam nach Asien",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt",
+        airline_names="China Southern (CZ)",
+        primary_airline_iata="CZ",
+        iata_origin="AMS",
+        iata_via=["CAN"],
+        iata_destination="KUL",
+        additional_destinations=["KUL (~1.820 €)", "BKK (~1.785 €)", "SIN (~1.850 €)"],
+        is_open_jaw=False,
+        iata_return_end="AMS",
+        region="Asien",
+        sample_outbound_date="2027-02-10",
+        sample_return_date="2027-02-24",
+        price_eur=1820,
+        booking_class="I",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="1-2-1 Lie-Flat A350",
+        routing_advice="",
+        rejection_reason="",
+    )
+
+    captured_prompts: list[str] = []
+    mock_resp = MagicMock()
+    mock_resp.parsed = deal_kul
+
+    def fake_gen(client, prompt, **kwargs):
+        captured_prompts.append(prompt)
+        return mock_resp
+
+    with (
+        patch.dict(CONFIG["destinations"], {"priority_destinations": ["MNL", "KUL"]}),
+        patch("bot.generate_with_gemini_fallback", side_effect=fake_gen),
+    ):
+        evaluated = evaluate_with_gemini(
+            MagicMock(),
+            "China Southern Business Class ab Amsterdam nach Asien ab 1.785 €",
+            "Business Class ab AMS nach Bangkok (1.785 €), Kuala Lumpur (1.820 €) und Singapur (1.850 €).",
+        )
+        msg_priority = build_telegram_message(evaluated, "China Southern AMS -> Asien", "https://example.com/cz-sale")
+
+    assert len(captured_prompts) == 1
+    assert "WUNSCHZIELE BEI SAMMEL-DEALS" in captured_prompts[0]
+    assert "MNL, KUL" in captured_prompts[0]
+    assert "additional_destinations" in captured_prompts[0]
+    assert evaluated.additional_destinations == ["BKK (~1.785 €)", "SIN (~1.850 €)"]
+    assert "✈️ <b>Top-Bordprodukt ⭐</b>" in msg_priority
+    assert "• <b>Weitere Ziele im Sale:</b> BKK (~1.785 €), SIN (~1.850 €)" in msg_priority
+
+    # 3. Normaler Einzelziel-Deal ohne Wunschziel hat weder ⭐ noch 'Weitere Ziele im Sale'
+    deal_bkk = deal_kul.model_copy(update={"iata_destination": "BKK", "additional_destinations": []})
+    with patch.dict(CONFIG["destinations"], {"priority_destinations": ["MNL", "KUL"]}):
+        msg_normal = build_telegram_message(deal_bkk, "China Southern AMS -> BKK", "https://example.com/cz-bkk")
+    assert "⭐" not in msg_normal
+    assert "Weitere Ziele im Sale" not in msg_normal
+
+
+def test_deterministic_airbag_regions_origins_and_prices():
+    base_deal = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Cathay Pacific Business Class ab Frankfurt nach Hongkong",
+        is_relevant=True,
+        deal_category="Top-Bordprodukt (Oneworld)",
+        airline_names="Cathay Pacific (CX)",
+        primary_airline_iata="CX",
+        iata_origin="FRA",
+        iata_via=[],
+        iata_destination="HKG",
+        is_open_jaw=False,
+        iata_return_end="FRA",
+        region="Asien",
+        sample_outbound_date="2027-03-10",
+        sample_return_date="2027-03-22",
+        price_eur=2509,
+        booking_class="I",
+        mm_points=0,
+        mm_qualifying_points=0,
+        cabin_assessment="1-2-1 Aria Suite A350",
+        routing_advice="",
+        rejection_reason="",
+    )
+
+    # 1. Home-Hub FRA bis 2.600 € erlaubt, darüber abgelehnt
+    ok_fra, _ = validate_deal_safety(base_deal, "Cathay Business ab Frankfurt", "Ab FRA nach HKG für 2.509 €")
+    assert ok_fra is True
+    ok_fra_over, reason_fra_over = validate_deal_safety(
+        base_deal.model_copy(update={"price_eur": 2650}),
+        "Cathay Business ab Frankfurt",
+        "Ab FRA nach HKG für 2.650 €",
+    )
+    assert ok_fra_over is False
+    assert "2600" in reason_fra_over
+
+    # 2. CPH ist nicht mehr in preferred_hubs -> Ex-EU-Limit (2.000 €) greift!
+    cph_ok = base_deal.model_copy(update={"iata_origin": "CPH", "iata_return_end": "CPH", "price_eur": 1980})
+    ok_cph, _ = validate_deal_safety(cph_ok, "Business ab Kopenhagen", "Ab Kopenhagen (CPH) nach HKG für 1.980 €")
+    assert ok_cph is True
+    ok_cph_over, reason_cph_over = validate_deal_safety(
+        cph_ok.model_copy(update={"price_eur": 2099}),
+        "Business ab Kopenhagen",
+        "Ab Kopenhagen (CPH) nach HKG für 2.099 €",
+    )
+    assert ok_cph_over is False
+    assert "2000" in reason_cph_over
+
+    # 3. Regression PAR-SEZ-KQ: Seychellen (SEZ) werden auch dann geblockt, wenn das Modell region='Asien' setzt
+    deal_sez = base_deal.model_copy(
+        update={"iata_origin": "CDG", "iata_return_end": "CDG", "iata_destination": "SEZ", "price_eur": 1860}
+    )
+    ok_sez, reason_sez = validate_deal_safety(deal_sez, "Business Paris Seychellen", "Ab Paris (CDG) nach SEZ")
+    assert ok_sez is False
+    assert "SEZ" in reason_sez
+
+    # 4. Regression HAM-DAM-EW: Nahost außerhalb von sweet_spots (DAM) wird strikt abgelehnt
+    deal_dam = base_deal.model_copy(
+        update={
+            "iata_origin": "HAM",
+            "iata_return_end": "HAM",
+            "iata_destination": "DAM",
+            "region": "Nahost",
+            "price_eur": 700,
+        }
+    )
+    ok_dam, reason_dam = validate_deal_safety(deal_dam, "Eurowings Business ab Hamburg", "Ab HAM nach Damaskus (DAM)")
+    assert ok_dam is False
+    assert "Sweet-Spots" in reason_dam
+
+    # 5. Georgien (TBS) in sweet_spots ist auch bei günstigem Kurz-/Mittelstreckenpreis (540 €) erlaubt, < 280 € jedoch gesperrt
+    deal_tbs = base_deal.model_copy(
+        update={
+            "iata_origin": "FRA",
+            "iata_return_end": "FRA",
+            "iata_destination": "TBS",
+            "region": "Zentralasien",
+            "price_eur": 540,
+        }
+    )
+    ok_tbs, _ = validate_deal_safety(deal_tbs, "Lufthansa Business nach Tiflis", "Ab Frankfurt (FRA) nach Tiflis (TBS)")
+    assert ok_tbs is True
+    ok_tbs_eco, _ = validate_deal_safety(
+        deal_tbs.model_copy(update={"price_eur": 199}),
+        "Flug nach Tiflis",
+        "Ab Frankfurt (FRA) nach Tiflis (TBS)",
+    )
+    assert ok_tbs_eco is False
+
+    # 6. Nicht-Europa-Origins (z.B. CAI, PEK oder unbekannter Code mit is_origin_in_europe=False) werden geblockt
+    deal_cai = base_deal.model_copy(update={"iata_origin": "CAI", "iata_return_end": "CAI", "price_eur": 1200})
+    ok_cai, reason_cai = validate_deal_safety(deal_cai, "Business ex Cairo", "Business Class from CAI to HKG")
+    assert ok_cai is False
+    assert "außerhalb Europas" in reason_cai
+
+    deal_unknown_non_eu = base_deal.model_copy(
+        update={"iata_origin": "CBR", "iata_return_end": "CBR", "price_eur": 1500, "is_origin_in_europe": False}
+    )
+    ok_cbr, _ = validate_deal_safety(deal_unknown_non_eu, "Business ex Canberra", "Business Class from CBR to HKG")
+    assert ok_cbr is False
+
+    # 7. Preis 0 € (Übersichtsartikel) wird geblockt
+    ok_zero, _ = validate_deal_safety(
+        base_deal.model_copy(update={"price_eur": 0}), "Übersicht", "Business Class ab FRA"
+    )
+    assert ok_zero is False
+
+
+def test_seen_urls_reevaluation_forum_guard_and_upsert():
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
+        test_db = tmp.name
+
+    try:
+        # Simuliere Alt-Datenbank ohne last_seen_at / entry_published_at und prüfe automatische Migration
+        raw_conn = sqlite3.connect(test_db)
+        raw_conn.execute(
+            "CREATE TABLE seen_urls (url_clean TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        raw_conn.execute(
+            "INSERT INTO seen_urls (url_clean, created_at) VALUES (?, ?)",
+            ("https://reisetopia.de/deals/finnair-business-class-angebote-deutschland-seoul/", "2026-11-02 10:58:07"),
+        )
+        raw_conn.commit()
+        raw_conn.close()
+
+        conn = init_db(test_db)
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_urls)").fetchall()}
+        assert {"url_clean", "created_at", "last_seen_at", "entry_published_at"}.issubset(cols)
+
+        reisetopia_url = "https://reisetopia.de/deals/finnair-business-class-angebote-deutschland-seoul/"
+        ref_now = datetime(2026, 11, 24, 12, 0, 0, tzinfo=timezone.utc)
+
+        # 1. Recycelter Artikel mit frischem RSS-Datum (22 Tage neuer & innerhalb 72h) -> MUSS re-evaluiert werden!
+        fresh_entry = {"published_parsed": time.strptime("2026-11-24 08:30:00", "%Y-%m-%d %H:%M:%S")}
+        pub_utc = extract_entry_published_utc(fresh_entry)
+        assert pub_utc == "2026-11-24 08:30:00"
+        assert (
+            should_evaluate_url(
+                conn,
+                reisetopia_url,
+                entry_published_utc=pub_utc,
+                feed_url="https://reisetopia.de/feed/",
+                now_utc=ref_now,
+            )
+            is True
+        )
+
+        # 2. upsert_seen_url aktualisiert bestehenden Eintrag ohne UNIQUE-Constraint-Fehler; direkter Zweitlauf überspringt
+        upsert_seen_url(conn, reisetopia_url, pub_utc)
+        assert (
+            should_evaluate_url(
+                conn,
+                reisetopia_url,
+                entry_published_utc=pub_utc,
+                feed_url="https://reisetopia.de/feed/",
+                now_utc=ref_now,
+            )
+            is False
+        )
+
+        # 3. Rollout-Schutz: Veraltetes Update (> 72h alt) wird NICHT re-evaluiert
+        stale_url = "https://reisetopia.de/deals/old-recycled-deal/"
+        conn.execute(
+            "INSERT INTO seen_urls (url_clean, created_at) VALUES (?, ?)",
+            (stale_url, "2026-10-31 12:00:00"),
+        )
+        conn.commit()
+        assert (
+            should_evaluate_url(
+                conn,
+                stale_url,
+                entry_published_utc="2026-11-10 09:00:00",
+                feed_url="https://reisetopia.de/feed/",
+                now_utc=ref_now,
+            )
+            is False
+        )
+
+        # 4. Foren-Schutz: Vielfliegertreff-Threads werden bei neuen Antworten NICHT re-evaluiert
+        vft_url = "https://www.vielfliegertreff.de/forum/threads/test-deal.167000/"
+        upsert_seen_url(conn, vft_url, "2026-11-01 10:00:00")
+        assert (
+            should_evaluate_url(
+                conn,
+                vft_url,
+                entry_published_utc="2026-11-24 11:00:00",
+                feed_url="https://www.vielfliegertreff.de/forum/forums/53/index.rss",
+                now_utc=ref_now,
+            )
+            is False
+        )
+
+        # 5. cleanup_db nutzt COALESCE(last_seen_at, created_at): kürzlich aktualisierte Alt-URL bleibt erhalten
+        conn.execute(
+            "INSERT INTO seen_urls (url_clean, created_at, last_seen_at) VALUES (?, datetime('now', '-120 days'), datetime('now', '-5 days'))",
+            ("https://reisetopia.de/deals/evergreen-deal/",),
+        )
+        conn.commit()
+        cleanup_db(conn)
+        kept = conn.execute(
+            "SELECT COUNT(*) FROM seen_urls WHERE url_clean = 'https://reisetopia.de/deals/evergreen-deal/'"
+        ).fetchone()[0]
+        assert kept == 1
+        close_db(conn)
+    finally:
+        if os.path.exists(test_db):
+            os.remove(test_db)
+
+
+def test_url_path_segment_pre_filter_and_newsletter_normalization():
+    # 1. Newsletter-Tracking (__s, vgo_ee) & Host-Casing werden sauber bereinigt
+    nl_url = (
+        "HTTPS://Reisetopia.de/deals/cathay-pacific-business-class-angebot-hongkong/?__s=abc&utm_source=drip&vgo_ee=xyz"
+    )
+    assert normalize_url(nl_url) == "https://reisetopia.de/deals/cathay-pacific-business-class-angebot-hongkong/"
+
+    # 2. Redaktionelle Pfade werden selbst mit 'Business Class' im Titel sofort verworfen
+    for blocked_url in (
+        "https://reisetopia.de/news/eurowings-naher-osten/",
+        "https://reisetopia.de/reviews/lufthansa-business-class-kurz-und-mittelstrecke/",
+        "https://reisetopia.de/guides/amex-business-platinum-guthaben/",
+        "https://reisetopia.de/gutscheine/qatar-airways-gutschein-angebote/",
+        "https://reisetopia.de/kolumne/business-class-kleinraummaschinen/",
+        "https://reisetopia.de/stories/singapore-airlines-neue-business-class-erste-eindruecke/",
+        "https://travel-dealz.de/blog/bewertung-cathay-aria-suite/",
+    ):
+        ok, reason = is_feed_entry_eligible_pre_filter(
+            "Neue Business Class vorgestellt",
+            "Alle Infos zur Business Class.",
+            "https://reisetopia.de/feed/",
+            entry_url=blocked_url,
+        )
+        assert ok is False
+        assert "Redaktioneller URL-Pfad" in reason
+
+    # 3. Echte Deal-Pfade (auch mit Substring 'news' im Slug oder '/ticker/') bleiben erlaubt
+    for allowed_url in (
+        "https://reisetopia.de/deals/news-flash-sale-business-class/",
+        "https://travel-dealz.de/ticker/lufthansa-business-class-bangkok/",
+    ):
+        ok, _ = is_feed_entry_eligible_pre_filter(
+            "Lufthansa Business Class Sale nach Bangkok",
+            "Business Class ab 1.799 Euro.",
+            "https://reisetopia.de/feed/",
+            entry_url=allowed_url,
+        )
+        assert ok is True
+
+    # 4. Neue Finanz-/Redaktions-Keywords greifen hart
+    ok_fin, _ = is_feed_entry_eligible_pre_filter(
+        "Festgeld Zinsen sichern & Business Class fliegen",
+        "Business Class",
+        "https://reisetopia.de/feed/",
+        entry_url="https://reisetopia.de/deals/festgeld-aktion/",
+    )
+    assert ok_fin is False
+
+
+def test_afc_config_emits_no_sdk_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        cfg = types.GenerateContentConfig(
+            temperature=0.1,
+            automatic_function_calling={"disable": True, "maximum_remote_calls": None},
+        )
+        assert _extra_utils.should_disable_afc(cfg) is True
+    assert not any("automatic_function_calling" in rec.message for rec in caplog.records)

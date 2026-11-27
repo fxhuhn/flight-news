@@ -1,4 +1,5 @@
 import base64
+import calendar
 import html
 import logging
 import os
@@ -11,7 +12,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -181,16 +182,32 @@ def load_config() -> dict[str, Any]:
     defaults: dict[str, Any] = {
         "origin": {
             "home_airport": "HAM",
-            "preferred_hubs": ["HAM", "FRA", "BER", "CPH"],
+            "preferred_hubs": ["HAM", "FRA", "BER"],
         },
         "destinations": {
             "regions": ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"],
-            "sweet_spots": ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"],
+            "sweet_spots": [
+                "DXB",
+                "DWC",
+                "AUH",
+                "JED",
+                "RUH",
+                "MCT",
+                "SLL",
+                "DOH",
+                "AMM",
+                "AQJ",
+                "TLV",
+                "BEY",
+                "TBS",
+                "BUS",
+                "KUT",
+            ],
+            "priority_destinations": ["MNL", "KUL"],
         },
         "pricing": {
-            "max_price_home_hubs": 2400,
-            "max_price_ex_eu": 1900,
-            "max_price_top_cabin_ex_eu": 1950,
+            "max_price_home_hubs": 2600,
+            "max_price_ex_eu": 2000,
         },
         "airlines": {
             "ignored_airlines": [
@@ -206,6 +223,7 @@ def load_config() -> dict[str, Any]:
             "initial_seed_max_deals": 5,
             "max_entries_per_feed": 25,
             "sent_deals_retention_days": 21,
+            "url_reeval_after_days": 7,
             "enable_google_flights_live_check": True,
         },
     }
@@ -229,8 +247,13 @@ def load_config() -> dict[str, Any]:
 CONFIG = load_config()
 HOME_AIRPORT: str = str(CONFIG["origin"].get("home_airport", "HAM")).strip().upper()
 PREFERRED_HUBS: set[str] = {
-    str(h).strip().upper() for h in CONFIG["origin"].get("preferred_hubs", ["HAM", "FRA", "BER", "CPH"])
+    str(h).strip().upper() for h in CONFIG["origin"].get("preferred_hubs", ["HAM", "FRA", "BER"])
 }
+PRIORITY_DESTINATIONS: list[str] = [
+    str(d).strip().upper()
+    for d in CONFIG.get("destinations", {}).get("priority_destinations", ["MNL", "KUL"])
+    if str(d).strip()
+]
 IGNORED_AIRLINES: list[str] = [
     str(a).strip() for a in CONFIG.get("airlines", {}).get("ignored_airlines", []) if str(a).strip()
 ]
@@ -240,6 +263,10 @@ MAX_ENTRIES_PER_FEED: int = int(
 SENT_DEALS_RETENTION_DAYS: int = max(
     1,
     int(os.environ.get("SENT_DEALS_RETENTION_DAYS", CONFIG.get("system", {}).get("sent_deals_retention_days", 21))),
+)
+URL_REEVAL_AFTER_DAYS: int = max(
+    1,
+    int(os.environ.get("URL_REEVAL_AFTER_DAYS", CONFIG.get("system", {}).get("url_reeval_after_days", 7))),
 )
 _gf_live_check_env = os.environ.get("ENABLE_GF_LIVE_CHECK")
 ENABLE_GF_LIVE_CHECK: bool = (
@@ -319,7 +346,23 @@ POSITIVE_CLASS_KEYWORDS = [
     "mint suite",
 ]
 
-# Harte Negativ-Keywords: Führen IMMER zum Ausschluss (Fragen, Meilenkauf, Hotels, etc.)
+# Redaktionelle URL-Pfadsegmente ohne konkrete Flug-Tarife (exakter Segment-Match vor Scraping & LLM)
+NON_DEAL_URL_SEGMENTS = {
+    "news",
+    "reviews",
+    "review",
+    "guides",
+    "guide",
+    "kolumne",
+    "gutscheine",
+    "gutschein",
+    "stories",
+    "blog",
+    "tripreport",
+    "kreditkarten",
+}
+
+# Harte Negativ-Keywords: Führen IMMER zum Ausschluss (Fragen, Meilenkauf, Hotels, Finanzprodukte, Reviews)
 HARD_NEGATIVE_KEYWORDS = [
     "frage:",
     "question:",
@@ -333,9 +376,16 @@ HARD_NEGATIVE_KEYWORDS = [
     "hotel",
     "kreditkarte",
     "girokonto",
+    "festgeld",
+    "tagesgeld",
+    "altersvorsorgedepot",
     "points kaufen",
     "punkte kaufen",
     "meilen kaufen",
+    "meilenabwertung",
+    "coffeebreak",
+    "tripreport",
+    "review:",
 ]
 
 # Schwache Negativ-Keywords: Schließen Billig-/Economy-Flüge aus,
@@ -356,16 +406,25 @@ WEAK_NEGATIVE_KEYWORDS = [
 ]
 
 
-def is_feed_entry_eligible_pre_filter(entry_title: str, entry_content: str, feed_url: str = "") -> tuple[bool, str]:
+def is_feed_entry_eligible_pre_filter(
+    entry_title: str, entry_content: str, feed_url: str = "", entry_url: str = ""
+) -> tuple[bool, str]:
     """
-    Deterministischer Pre-Filter vor jedem KI-Aufruf:
-    1. Prüfung auf harte Negativ-Keywords im Titel (Fragen, Hotels, Meilenkauf -> sofortiger Ausschluss).
+    Deterministischer Pre-Filter vor jedem Scraping & KI-Aufruf:
+    0. Exakter URL-Pfadsegment-Filter (sortiert /news/, /reviews/, /guides/, /blog/ etc. sofort aus).
+    1. Prüfung auf harte Negativ-Keywords im Titel (Fragen, Hotels, Finanzprodukte, Meilenkauf -> sofortiger Ausschluss).
     2. Hat der Titel ein explizites Positiv-Signal ('business class', 'first class', 'qsuite' etc.),
        werden schwache Negativ-Keywords ('economy', 'full-service') im Titel ignoriert (verhindert False Negatives).
     3. Andernfalls führen schwache Negativ-Keywords im Titel zum Ausschluss.
     4. Bei gemischten Feeds (Fly4free, Reisetopia etc.): Zwingende Pflicht zu mindestens einem Positiv-Keyword
        in Titel oder Text.
     """
+    if entry_url:
+        path_segments = [seg for seg in urllib.parse.urlsplit(entry_url.strip()).path.lower().split("/") if seg]
+        for seg in path_segments:
+            if seg in NON_DEAL_URL_SEGMENTS:
+                return False, f"Redaktioneller URL-Pfad ausgeschlossen: '/{seg}/'"
+
     title_lower = entry_title.lower()
     content_lower = entry_content.lower()
     combined = f"{title_lower} {content_lower}"
@@ -401,10 +460,12 @@ def is_feed_entry_eligible_pre_filter(entry_title: str, entry_content: str, feed
 
 
 def _make_iata_via_required(schema: dict[str, Any]) -> None:
-    """Stellt sicher, dass Gemini Structured Outputs das Feld 'iata_via' immer aktiv befüllt."""
+    """Stellt sicher, dass Gemini Structured Outputs 'iata_via', 'additional_destinations' und 'is_origin_in_europe' immer aktiv befüllt."""
     req = schema.setdefault("required", [])
-    if isinstance(req, list) and "iata_via" not in req:
-        req.append("iata_via")
+    if isinstance(req, list):
+        for field_name in ("iata_via", "additional_destinations", "is_origin_in_europe"):
+            if field_name not in req:
+                req.append(field_name)
 
 
 DealCategory = Literal[
@@ -467,6 +528,14 @@ class FlightDealEvaluation(BaseModel):
             "der im Text gar nicht angeboten wird!"
         )
     )
+    is_origin_in_europe: bool = Field(
+        default=True,
+        description=(
+            "True, wenn iata_origin geografisch in Europa liegt (inkl. EU, UK, Schweiz, Norwegen, Island, Balkan, Türkei/IST). "
+            "Zwingend False bei Abflug außerhalb Europas (z.B. Kairo CAI, Tunis TUN, Casablanca CMN, Peking PEK, Hongkong HKG, "
+            "Singapur SIN, Dubai DXB, New York JFK, Miami MIA, São Paulo GRU)!"
+        ),
+    )
     iata_via: list[str] = Field(
         default_factory=list,
         description=(
@@ -482,6 +551,15 @@ class FlightDealEvaluation(BaseModel):
         ),
     )
     iata_destination: str = Field(description="3-Letter IATA Code des Hauptziels (z.B. BKK, SIN, GRU)")
+    additional_destinations: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Weitere im selben Sale/Artikel explizit genannte buchbare Ziele in erlaubten Zielregionen "
+            "(OHNE iata_destination selbst zu wiederholen), kompakt mit 3-Letter IATA-Code und Preis falls genannt, "
+            "z.B. ['KUL (~1.820 €)', 'SIN (~1.850 €)', 'MNL (~1.890 €)']. "
+            "Maximal 6 Einträge. Bei Einzelziel-Deals zwingend leere Liste []."
+        ),
+    )
     is_open_jaw: bool = Field(description="True, falls Gabelflug (Rückflug endet an anderem Flughafen als iata_origin)")
     iata_return_end: str = Field(
         description="3-Letter IATA Code des Rückflug-Endpunkts (identisch mit iata_origin bei normalem Return)"
@@ -1014,12 +1092,416 @@ def format_deal_route_plain(deal: FlightDealEvaluation) -> str:
     return route
 
 
+# Kurz-/Mittelstrecken-Sweet-Spots (Georgien & Levante), bei denen reguläre Business-Tarife < 750 € kosten können
+SHORT_MEDIUM_HAUL_SWEET_SPOTS: set[str] = {"TBS", "BUS", "KUT", "TLV", "BEY", "AMM", "AQJ"}
+
+# Deterministische Positivliste europäischer Abflughäfen (Fast-Path für Europa-Origin-Check)
+KNOWN_EUROPE_AIRPORTS: set[str] = {
+    "HAM",
+    "FRA",
+    "BER",
+    "MUC",
+    "DUS",
+    "CGN",
+    "STR",
+    "HAJ",
+    "NUE",
+    "BRE",
+    "LEJ",
+    "DRS",
+    "FMO",
+    "PAD",
+    "FDH",
+    "CPH",
+    "BLL",
+    "AAL",
+    "AAR",
+    "AMS",
+    "EIN",
+    "RTM",
+    "BRU",
+    "CRL",
+    "LUX",
+    "CDG",
+    "ORY",
+    "LYS",
+    "NCE",
+    "MRS",
+    "TLS",
+    "BOD",
+    "NTE",
+    "BSL",
+    "ZRH",
+    "GVA",
+    "VIE",
+    "SZG",
+    "GRZ",
+    "INN",
+    "LNZ",
+    "KLU",
+    "WAW",
+    "KRK",
+    "GDN",
+    "WRO",
+    "POZ",
+    "KTW",
+    "PRG",
+    "BTS",
+    "BUD",
+    "OTP",
+    "CLJ",
+    "TSR",
+    "SOF",
+    "VAR",
+    "ZAG",
+    "SPU",
+    "DBV",
+    "LJU",
+    "BEG",
+    "SKP",
+    "TIA",
+    "SJJ",
+    "PRN",
+    "TGD",
+    "ATH",
+    "SKG",
+    "HER",
+    "RHO",
+    "CFU",
+    "LCA",
+    "PFO",
+    "MLA",
+    "FCO",
+    "CIA",
+    "MXP",
+    "LIN",
+    "BGY",
+    "VCE",
+    "BLQ",
+    "NAP",
+    "FLR",
+    "PSA",
+    "TRN",
+    "VRN",
+    "BRI",
+    "CTA",
+    "PMO",
+    "MAD",
+    "BCN",
+    "AGP",
+    "PMI",
+    "IBZ",
+    "VLC",
+    "BIO",
+    "SVQ",
+    "ALC",
+    "TFN",
+    "TFS",
+    "LPA",
+    "LIS",
+    "OPO",
+    "FAO",
+    "FNC",
+    "PDL",
+    "LHR",
+    "LGW",
+    "STN",
+    "LTN",
+    "LCY",
+    "MAN",
+    "EDI",
+    "BHX",
+    "GLA",
+    "BRS",
+    "NCL",
+    "BFS",
+    "DUB",
+    "ORK",
+    "SNN",
+    "OSL",
+    "BGO",
+    "TRD",
+    "SVG",
+    "TOS",
+    "ARN",
+    "GOT",
+    "MMX",
+    "HEL",
+    "TLL",
+    "RIX",
+    "VNO",
+    "KEF",
+    "IST",
+    "SAW",
+    "ESB",
+    "AYT",
+    "ADB",
+}
+
+# Bekannte Nicht-Europa-Abflughäfen (harter Sperrfilter gegen Reverse-, Ex-Nordafrika- und Intra-Asien-Deals)
+NON_EUROPE_ORIGIN_AIRPORTS: set[str] = {
+    "CAI",
+    "HRG",
+    "SSH",
+    "TUN",
+    "CMN",
+    "RAK",
+    "ALG",
+    "ADD",
+    "NBO",
+    "MBA",
+    "DAR",
+    "JRO",
+    "ZNZ",
+    "JNB",
+    "CPT",
+    "DUR",
+    "WDH",
+    "SEZ",
+    "MRU",
+    "RUN",
+    "TNR",
+    "LOS",
+    "ACC",
+    "DSS",
+    "TMS",
+    "LAD",
+    "TLV",
+    "BEY",
+    "AMM",
+    "AQJ",
+    "DAM",
+    "BGW",
+    "IKA",
+    "KWI",
+    "BAH",
+    "DOH",
+    "AUH",
+    "DXB",
+    "DWC",
+    "SHJ",
+    "MCT",
+    "SLL",
+    "RUH",
+    "JED",
+    "DMM",
+    "MED",
+    "TBS",
+    "BUS",
+    "KUT",
+    "EVN",
+    "GYD",
+    "ALA",
+    "NQZ",
+    "TSE",
+    "TAS",
+    "SKD",
+    "FRU",
+    "DYU",
+    "DEL",
+    "BOM",
+    "BLR",
+    "HYD",
+    "MAA",
+    "CCU",
+    "COK",
+    "CMB",
+    "MLE",
+    "DAC",
+    "KTM",
+    "KHI",
+    "LHE",
+    "ISB",
+    "PEK",
+    "PKX",
+    "PVG",
+    "SHA",
+    "CAN",
+    "SZX",
+    "CTU",
+    "TFU",
+    "CKG",
+    "HGH",
+    "XMN",
+    "HKG",
+    "MFM",
+    "TPE",
+    "KHH",
+    "NRT",
+    "HND",
+    "KIX",
+    "NGO",
+    "FUK",
+    "CTS",
+    "ICN",
+    "GMP",
+    "PUS",
+    "ULN",
+    "BKK",
+    "DMK",
+    "HKT",
+    "CNX",
+    "SIN",
+    "KUL",
+    "PEN",
+    "CGK",
+    "DPS",
+    "SUB",
+    "MNL",
+    "CEB",
+    "CRK",
+    "SGN",
+    "HAN",
+    "DAD",
+    "PNH",
+    "RGN",
+    "VTE",
+    "SYD",
+    "MEL",
+    "BNE",
+    "PER",
+    "ADL",
+    "AKL",
+    "CHC",
+    "ZQN",
+    "NAN",
+    "PPT",
+    "GUM",
+    "HNL",
+    "JFK",
+    "EWR",
+    "LGA",
+    "BOS",
+    "PHL",
+    "IAD",
+    "DCA",
+    "BWI",
+    "ORD",
+    "DTW",
+    "MSP",
+    "ATL",
+    "MIA",
+    "FLL",
+    "MCO",
+    "TPA",
+    "DFW",
+    "IAH",
+    "AUS",
+    "DEN",
+    "PHX",
+    "LAS",
+    "LAX",
+    "SFO",
+    "SAN",
+    "SEA",
+    "PDX",
+    "YYZ",
+    "YUL",
+    "YVR",
+    "YYC",
+    "YOW",
+    "MEX",
+    "CUN",
+    "PTY",
+    "SJO",
+    "SAL",
+    "GUA",
+    "HAV",
+    "PUJ",
+    "SDQ",
+    "MBJ",
+    "NAS",
+    "BOG",
+    "MDE",
+    "LIM",
+    "UIO",
+    "GYE",
+    "CCS",
+    "GRU",
+    "GIG",
+    "VCP",
+    "BSB",
+    "EZE",
+    "AEP",
+    "COR",
+    "SCL",
+    "MVD",
+    "ASU",
+}
+
+# Häufig vom Modell fälschlich zu 'Asien' gezählte Nachbar-/Drittregionen-Ziele (greift nur, wenn NICHT in sweet_spots)
+EXCLUDED_DESTINATION_AIRPORTS: set[str] = {
+    "SEZ",
+    "MRU",
+    "RUN",
+    "ZNZ",
+    "TNR",
+    "CPT",
+    "JNB",
+    "DUR",
+    "NBO",
+    "MBA",
+    "DAR",
+    "JRO",
+    "WDH",
+    "ADD",
+    "TMS",
+    "LAD",
+    "CAI",
+    "HRG",
+    "SSH",
+    "CMN",
+    "RAK",
+    "TUN",
+    "ALG",
+    "LOS",
+    "ACC",
+    "SYD",
+    "MEL",
+    "BNE",
+    "PER",
+    "ADL",
+    "AKL",
+    "CHC",
+    "ZQN",
+    "NAN",
+    "PPT",
+    "GUM",
+    "HNL",
+    "JFK",
+    "EWR",
+    "LGA",
+    "BOS",
+    "IAD",
+    "ORD",
+    "ATL",
+    "MIA",
+    "DFW",
+    "IAH",
+    "LAX",
+    "SFO",
+    "SEA",
+    "YYZ",
+    "YUL",
+    "YVR",
+    "BAH",
+    "KWI",
+    "DAM",
+    "BGW",
+    "IKA",
+    "EVN",
+    "GYD",
+}
+
+
 def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str) -> tuple[bool, str]:
     """
     Deterministische Sicherheitsprüfungen (Airbag) nach der Gemini-Evaluierung:
     1. Kabinenklassen-Beweis: Wurde Business/First explizit nachgewiesen?
-    2. Langstrecken-Preisplausibilität: Interkontinental Return < 750 € ist ohne expliziten Error-Fare-Nachweis unplausibel.
-    3. Abflughafen-Verifikation: Kommt iata_origin im Text oder Titel vor?
+    2. Konkreter Flugpreis & Preisplausibilität (< 750 € Langstrecke bzw. < 280 € Kurz-/Mittelstrecken-Sweet-Spots).
+    3. Abflughafen-Verifikation (kein Origin-Hijacking) & Europa-Origin-Pflicht.
+    4. Verbindliche Zielregions- & Sweet-Spot-Prüfung (verhindert Ausreißer wie SEZ oder DAM).
+    5. Verbindliche Preislimit-Prüfung (Home-Hubs vs. Ex-EU aus config.toml).
     """
     if deal is None or not deal.is_relevant or deal.deal_category == "Irrelevant":
         return True, ""
@@ -1032,12 +1514,22 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
     if not quote or quote.upper() == "KEIN NACHWEIS":
         return False, "Kein Textnachweis für Business/First Class vorhanden"
 
-    # 2. Langstrecken-Preisplausibilität
-    # Flüge nach Asien, Zentralasien, Südamerika, Mittelamerika kosten in Business regulär >= 1.000 €.
-    # Preise < 750 € Return sind zu 99% Economy-Tarife, außer es ist ausdrücklich ein Error Fare.
-    if deal.region in ("Asien", "Zentralasien", "Südamerika", "Mittelamerika") and deal.price_eur < 750:
-        combined_lower = f"{title} {full_text}".lower()
-        if not any(ef in combined_lower for ef in ("error fare", "error-fare", "preisfehler", "errorfare")):
+    # 2. Konkreter Preis & Untergrenzen-Plausibilität
+    if deal.price_eur <= 0:
+        return False, "Kein konkreter Flugpreis genannt (0 €)"
+
+    dest = normalize_airport_iata(deal.iata_destination)
+    combined_lower = f"{title} {full_text}".lower()
+    has_error_fare_signal = any(ef in combined_lower for ef in ("error fare", "error-fare", "preisfehler", "errorfare"))
+
+    if dest in SHORT_MEDIUM_HAUL_SWEET_SPOTS:
+        if deal.price_eur < 280 and not has_error_fare_signal:
+            return (
+                False,
+                f"Unplausibler Business-Class-Preis für Kurz-/Mittelstrecke ({dest}): {deal.price_eur} € (Verdacht auf Economy)",
+            )
+    elif deal.region in ("Asien", "Zentralasien", "Südamerika", "Mittelamerika") and deal.price_eur < 750:
+        if not has_error_fare_signal:
             return (
                 False,
                 f"Unplausibler Langstreckenpreis für Business Class: {deal.price_eur} € (Verdacht auf Economy)",
@@ -1080,6 +1572,46 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
         aliases = airport_aliases.get(origin, [])
         if not any(alias in combined_upper for alias in aliases):
             return False, f"Abflughafen {origin} kommt im Deal-Text nicht vor (Origin-Hijacking abgefangen)"
+
+    # 4. Europa-Origin-Pflicht (Hybrid: Negativliste -> Europa-Fast-Path -> Schema-Flag)
+    norm_origin = normalize_airport_iata(origin)
+    hubs_set = {
+        normalize_airport_iata(str(h))
+        for h in CONFIG.get("origin", {}).get("preferred_hubs", list(PREFERRED_HUBS))
+        if str(h).strip()
+    }
+    if norm_origin in NON_EUROPE_ORIGIN_AIRPORTS:
+        return False, f"Startflughafen {norm_origin} liegt außerhalb Europas"
+    if norm_origin and norm_origin not in KNOWN_EUROPE_AIRPORTS and norm_origin not in hubs_set:
+        if not getattr(deal, "is_origin_in_europe", True):
+            return False, f"Startflughafen {norm_origin} liegt laut Auswertung außerhalb Europas"
+
+    # 5. Zielregions- & Sweet-Spot-Prüfung
+    sweet_spots_set = {
+        normalize_airport_iata(str(s)) for s in CONFIG.get("destinations", {}).get("sweet_spots", []) if str(s).strip()
+    }
+    allowed_regions = {
+        str(r).strip()
+        for r in CONFIG.get("destinations", {}).get("regions", ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"])
+    }
+    if dest not in sweet_spots_set:
+        if deal.region == "Nahost":
+            return False, f"Nahost-Ziel {dest} gehört nicht zu den erlaubten Sweet-Spots"
+        if dest in EXCLUDED_DESTINATION_AIRPORTS:
+            return False, f"Ziel {dest} liegt außerhalb der erlaubten Zielregionen"
+        if deal.region not in allowed_regions:
+            return False, f"Zielregion '{deal.region}' ({dest}) gehört nicht zu den erlaubten Zielregionen"
+
+    # 6. Verbindliche Preislimit-Prüfung (Option A: Home-Hubs vs. Ex-EU)
+    pricing_cfg = CONFIG.get("pricing", {})
+    max_home = int(pricing_cfg.get("max_price_home_hubs", 2600))
+    max_ex_eu = int(pricing_cfg.get("max_price_ex_eu", 2000))
+    if norm_origin in hubs_set:
+        if deal.price_eur > max_home:
+            return False, f"Preis {deal.price_eur} € überschreitet Limit ab bevorzugten Hubs ({max_home} €)"
+    else:
+        if deal.price_eur > max_ex_eu:
+            return False, f"Preis {deal.price_eur} € überschreitet Ex-EU-Limit ({max_ex_eu} €)"
 
     return True, ""
 
@@ -1136,6 +1668,13 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
         )
 
         # Automatische sanfte Schema-Migration für bestehende Datenbanken
+        c.execute("PRAGMA table_info(seen_urls)")
+        seen_cols = {col[1] for col in c.fetchall()}
+        if "last_seen_at" not in seen_cols:
+            c.execute("ALTER TABLE seen_urls ADD COLUMN last_seen_at TIMESTAMP")
+        if "entry_published_at" not in seen_cols:
+            c.execute("ALTER TABLE seen_urls ADD COLUMN entry_published_at TIMESTAMP")
+
         c.execute("PRAGMA table_info(sent_deals)")
         existing_cols = {col[1] for col in c.fetchall()}
         if "price_eur" not in existing_cols:
@@ -1174,7 +1713,7 @@ def cleanup_db(conn: sqlite3.Connection, sent_deals_retention_days: int | None =
     )
     cutoff_modifier = f"-{retention_days} days"
     with closing(conn.cursor()) as c:
-        c.execute("DELETE FROM seen_urls WHERE created_at < datetime('now', '-90 days')")
+        c.execute("DELETE FROM seen_urls WHERE COALESCE(last_seen_at, created_at) < datetime('now', '-90 days')")
         deleted_urls = max(0, c.rowcount)
         c.execute(
             "DELETE FROM sent_deals WHERE COALESCE(updated_at, created_at) < datetime('now', ?)",
@@ -1268,15 +1807,113 @@ def record_sent_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation):
     conn.commit()
 
 
+_STRIP_QUERY_PREFIXES = ("utm_", "fbclid", "gclid", "mc_", "ref", "__s", "vgo_ee", "_hsenc", "_hsmi", "mkt_tok")
+
+
 def normalize_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url.strip())
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
     query_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
-    # Behalte Foren-Parameter (z.B. ?t=123), entferne nur Tracking-Parameter
-    clean_params = [
-        (k, v) for k, v in query_params if not k.lower().startswith(("utm_", "fbclid", "gclid", "mc_", "ref"))
-    ]
+    # Behalte Foren-Parameter (z.B. ?t=123), entferne nur Tracking- und Newsletter-Parameter
+    clean_params = [(k, v) for k, v in query_params if not k.lower().startswith(_STRIP_QUERY_PREFIXES)]
     clean_query = urllib.parse.urlencode(clean_params)
-    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, clean_query, ""))
+    return urllib.parse.urlunsplit((scheme, netloc, parsed.path, clean_query, ""))
+
+
+def extract_entry_published_utc(entry: dict[str, Any]) -> str | None:
+    """
+    Extrahiert den Veröffentlichungszeitpunkt eines RSS-Eintrags als UTC-String ('YYYY-MM-DD HH:MM:SS').
+    Priorisiert 'published_parsed' (<pubDate>) vor 'updated_parsed', damit bloße Tippfehler-Edits
+    keine unnötige Re-Evaluierung auslösen.
+    """
+    st = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not st:
+        return None
+    try:
+        ts = calendar.timegm(st)
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def is_forum_url(url: str, feed_url: str = "") -> bool:
+    """Erkennt Foren-URLs (z.B. Vielfliegertreff), deren pubDate bei jeder Antwort hochspringt."""
+    combined = f"{url} {feed_url}".lower()
+    return "vielfliegertreff.de" in combined or "/forum/threads/" in combined or "/forums/" in combined
+
+
+def _parse_sqlite_utc(ts_str: str | None) -> datetime | None:
+    if not ts_str:
+        return None
+    try:
+        return datetime.strptime(ts_str.strip()[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def should_evaluate_url(
+    conn: sqlite3.Connection,
+    url_clean: str,
+    entry_published_utc: str | None = None,
+    feed_url: str = "",
+    reeval_after_days: int | None = None,
+    max_freshness_hours: int = 72,
+    now_utc: datetime | None = None,
+) -> bool:
+    """
+    Prüft, ob eine Feed-URL ausgewertet werden soll:
+    - True, wenn die URL noch nie gesehen wurde.
+    - True bei redaktionellen Deal-Artikeln (nicht Foren!), deren RSS-Veröffentlichungsdatum
+      mindestens 'reeval_after_days' neuer als der gespeicherte Stand UND höchstens 'max_freshness_hours' alt ist.
+    - Sonst False.
+    """
+    with closing(conn.cursor()) as c:
+        c.execute("SELECT created_at, entry_published_at FROM seen_urls WHERE url_clean = ?", (url_clean,))
+        row = c.fetchone()
+
+    if not row:
+        return True
+
+    if is_forum_url(url_clean, feed_url) or not entry_published_utc:
+        return False
+
+    entry_dt = _parse_sqlite_utc(entry_published_utc)
+    stored_dt = _parse_sqlite_utc(row[1]) or _parse_sqlite_utc(row[0])
+    if not entry_dt or not stored_dt:
+        return False
+
+    days_threshold = max(
+        1,
+        int(
+            reeval_after_days
+            if reeval_after_days is not None
+            else CONFIG.get("system", {}).get("url_reeval_after_days", URL_REEVAL_AFTER_DAYS)
+        ),
+    )
+    ref_now = now_utc or datetime.now(timezone.utc)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=timezone.utc)
+
+    is_significantly_newer = entry_dt >= (stored_dt + timedelta(days=days_threshold))
+    is_fresh = entry_dt >= (ref_now - timedelta(hours=max_freshness_hours))
+    return is_significantly_newer and is_fresh
+
+
+def upsert_seen_url(conn: sqlite3.Connection, url_clean: str, entry_published_utc: str | None = None) -> None:
+    """Speichert oder aktualisiert eine verarbeitete URL transaktionssicher ohne UNIQUE-Constraint-Fehler."""
+    with closing(conn.cursor()) as c:
+        c.execute(
+            """
+            INSERT INTO seen_urls (url_clean, last_seen_at, entry_published_at)
+            VALUES (?, CURRENT_TIMESTAMP, ?)
+            ON CONFLICT(url_clean) DO UPDATE SET
+                last_seen_at = CURRENT_TIMESTAMP,
+                entry_published_at = COALESCE(excluded.entry_published_at, seen_urls.entry_published_at)
+            """,
+            (url_clean, entry_published_utc),
+        )
+    conn.commit()
 
 
 def clean_html(raw_html: str) -> str:
@@ -1724,11 +2361,11 @@ def generate_with_gemini_fallback(
     while candidate_models and transient_attempt <= max_transient_retries:
         current_model = candidate_models[0]
 
-        # Konfiguration vorbereiten (inkl. explizitem Request-Timeout & deaktiviertem AFC-Overhead)
+        # Konfiguration vorbereiten (inkl. explizitem Request-Timeout & warnungsfrei deaktiviertem AFC)
         gen_config: dict[str, Any] = {
             "temperature": 0.1,
             "http_options": {"timeout": http_timeout_ms},
-            "automatic_function_calling": {"disable": True},
+            "automatic_function_calling": {"disable": True, "maximum_remote_calls": None},
         }
         if response_schema:
             gen_config["response_mime_type"] = "application/json"
@@ -1848,8 +2485,52 @@ def generate_with_gemini_fallback(
     raise RuntimeError("Alle Gemini-Modelle und Retries erschöpft.")
 
 
+def normalize_additional_destinations(
+    raw_destinations: list[str] | None,
+    primary_dest: str = "",
+    max_items: int = 6,
+) -> list[str]:
+    """Bereinigt weitere Sale-Ziele: entfernt Platzhalter, Duplikate sowie das Hauptziel selbst."""
+    if not raw_destinations:
+        return []
+
+    primary = normalize_airport_iata(primary_dest)
+    placeholder_values = {"none", "null", "kein", "keine", "keiner", "-", "n/a", "nicht genannt"}
+    cleaned: list[str] = []
+    seen_keys: set[str] = set()
+
+    for entry in raw_destinations:
+        if not isinstance(entry, str):
+            continue
+        text = re.sub(r"\s+", " ", entry).strip().strip(",;")
+        if not text or text.lower() in placeholder_values:
+            continue
+
+        codes = [normalize_airport_iata(c) for c in re.findall(r"\b([A-Z]{3})\b", text.upper())]
+        non_currency_codes = [c for c in codes if c not in {"EUR", "USD", "CHF", "GBP"}]
+        if primary and primary in non_currency_codes:
+            continue
+
+        dedup_key = non_currency_codes[0] if non_currency_codes else text.lower()
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        cleaned.append(text)
+        if len(cleaned) >= max_items:
+            break
+
+    return cleaned
+
+
 def evaluate_with_gemini(client: genai.Client, title: str, clean_text: str) -> FlightDealEvaluation:
-    hubs_str = ", ".join(sorted(PREFERRED_HUBS))
+    hubs_list = sorted(
+        {
+            str(h).strip().upper()
+            for h in CONFIG.get("origin", {}).get("preferred_hubs", list(PREFERRED_HUBS))
+            if str(h).strip()
+        }
+    )
+    hubs_str = ", ".join(hubs_list)
     dest_regions = CONFIG["destinations"].get("regions", ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"])
     regions_str = ", ".join(dest_regions)
     central_asia_hint = ""
@@ -1862,12 +2543,28 @@ def evaluate_with_gemini(client: genai.Client, title: str, clean_text: str) -> F
             "\n   - AUSGESCHLOSSEN: Australien / Ozeanien (z.B. SYD, MEL, PER, ADL, AKL), Nordamerika, Afrika und Europa gehören NICHT zu Asien -> als region = 'Sonstige' und is_relevant = False ablehnen!"
         )
     sweet_spots = CONFIG["destinations"].get(
-        "sweet_spots", ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"]
+        "sweet_spots",
+        ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY", "TBS", "BUS", "KUT"],
     )
     sweet_spots_str = ", ".join(sweet_spots)
-    price_hubs = CONFIG["pricing"].get("max_price_home_hubs", 2400)
-    price_ex_eu = CONFIG["pricing"].get("max_price_ex_eu", 1900)
-    price_top_cabin = CONFIG["pricing"].get("max_price_top_cabin_ex_eu", 1950)
+    priority_dests = [
+        str(d).strip().upper() for d in CONFIG["destinations"].get("priority_destinations", []) if str(d).strip()
+    ]
+    priority_dests_hint = ""
+    if priority_dests:
+        priority_dests_str = ", ".join(priority_dests)
+        priority_dests_hint = (
+            f"\n   - WUNSCHZIELE BEI SAMMEL-DEALS: Wenn der Artikel MEHRERE Ziele in erlaubten Zielregionen anbietet "
+            f"und eines der Wunschziele ({priority_dests_str}) explizit als buchbar genannt UND preislich im Limit ist, "
+            f"wähle ZWINGEND dieses Wunschziel als 'iata_destination' (mit dessen konkretem Preis als 'price_eur')!"
+        )
+    multi_dest_hint = (
+        "\n   - WEITERE ZIELE IM SALE ('additional_destinations'): Wenn der Artikel mehrere buchbare Ziele in erlaubten Zielregionen "
+        "auflistet, nenne bis zu 6 weitere Ziele (OHNE 'iata_destination' zu wiederholen) kompakt in 'additional_destinations' "
+        "(Format: 'KUL (~1.820 €)' bzw. 'KUL', falls kein Einzelpreis genannt). Bei Einzelziel-Deals: []."
+    )
+    price_hubs = CONFIG["pricing"].get("max_price_home_hubs", 2600)
+    price_ex_eu = CONFIG["pricing"].get("max_price_ex_eu", 2000)
     ignored_airlines = CONFIG.get("airlines", {}).get("ignored_airlines", IGNORED_AIRLINES)
     ignored_airlines_str = ", ".join(ignored_airlines) if ignored_airlines else "Keine"
 
@@ -1884,7 +2581,7 @@ STRIKTE REGELN FÜR 'is_relevant = True':
      * Setze is_relevant = False
      * Setze deal_category = 'Irrelevant'
      * Setze rejection_reason = 'Nur Economy / Keine Business Class explizit genannt'
-2. Zielregion: {regions_str} (oder Nahost-Sweet-Spots für Miles & More QP: {sweet_spots_str}).{central_asia_hint}
+2. Zielregion: {regions_str} (oder erlaubte Sweet-Spot-Airports inkl. Nahost-QP & Georgien: {sweet_spots_str}).{central_asia_hint}{priority_dests_hint}{multi_dest_hint}
 3. STARTFLUGHAFEN, ZWISCHENSTOPPS & PRIORISIERUNG (KEIN ORIGIN-HIJACKING):
    - 'iata_origin' MUSS zwingend ein Flughafen sein, der im Artikel oder Buchungslink EXPLIZIT als buchbarer Abflugort für diesen Tarif genannt ist!
    - Wenn ein Deal NUR ab Warschau (WAW) oder Oslo (OSL) angeboten wird, MUSS iata_origin 'WAW' bzw. 'OSL' sein.
@@ -1895,7 +2592,7 @@ STRIKTE REGELN FÜR 'is_relevant = True':
    - Bei 1-Stopp-Verbindungen mit wahlweisem Hub (z.B. Lufthansa via Frankfurt oder München) schreibe ['FRA/MUC'] als EIN Element (nur bei zwei echten Stopps hintereinander zwei Elemente wie ['FRA', 'SIN']). Bei echten Nonstop-Flügen: [].
 4. Preis (Fremdwährungen wie USD, CHF, GBP, PLN, SEK, DKK zwingend in EUR umrechnen!):
    - Ab {hubs_str}: max. {price_hubs} EUR Return (jeder Preis <= {price_hubs} EUR ist preislich erlaubt).
-   - Ab Ex-EU (z.B. WAW, OSL, ARN, TLL, PRG, DUB, MXP, AMS, BUD): max. {price_ex_eu} EUR Return (bis {price_top_cabin} EUR bei Top-Kabinen wie Qatar Qsuite, Etihad A350/787 oder Turkish Airlines A350/787).
+   - Ab allen anderen europäischen Flughäfen / Ex-EU (z.B. CPH, MUC, AMS, WAW, OSL, ARN, PRG, DUB, MXP, BUD): max. {price_ex_eu} EUR Return.
 5. Miles & More Punkte-Logik (Stand Oktober 2026 | FTL-Statusziel: 650 Points, davon mind. 325 QP):
    - Vollintegriert (Points UND QP): LH (Lufthansa), VL (City Airlines), LX (SWISS), OS (Austrian Airlines), SN (Brussels Airlines), EW (Eurowings), 4Y (Discover Airlines), EN (Air Dolomiti), LO (LOT Polish Airlines), AZ (ITA Airways), LG (Luxair), OU (Croatia Airlines).
      -> KRITISCH LOT POLISH AIRLINES (LO): LOT ist ein VOLLINTEGRIERTER Miles & More Partner!
@@ -1909,7 +2606,7 @@ STRIKTE REGELN FÜR 'is_relevant = True':
    - KRITISCH Edelweiss (WK): Gibt 0 Points/0 QP unter WK-Flugnummer! Nur unter LX-Codeshare (LX8000-8499) gibt es Punkte/QP.
    - KRITISCH Asiana (OZ): Seit 15.10.2026 ausgeschieden -> 0 Points / 0 QP!
    - Andere Star Alliance (SQ, TP, TK, BR, NH, UA, AC, CM, AV, TG, ET, CA, MS, AI, ZH): Bringen NUR Points (40 kontinental / 200 pro Langstrecke), aber 0 QP!
-   - Fremd-Allianzen & allianzlose Airlines: 0 Points / 0 QP, aber relevant wenn Preis (< {price_ex_eu}-{price_top_cabin} EUR) & Hardware (z.B. Qsuite, Etihad Business Studio, Oman Air Apex Suite) stimmen:
+   - Fremd-Allianzen & allianzlose Airlines: 0 Points / 0 QP, aber relevant wenn Preis (<= {price_ex_eu} EUR Ex-EU bzw. <= {price_hubs} EUR ab {hubs_str}) & Hardware (z.B. Qsuite, Etihad Business Studio, Oman Air Apex Suite) stimmen:
      * Oneworld (QR, AY, BA, CX, JL, WY, RJ, IB, UL, AT, MH, QF, AA): deal_category = 'Top-Bordprodukt (Oneworld)'
      * SkyTeam (AF, KL, VS, UX, SK, SV, KE, CI, VN, GA, MU, MF, DL, AM): deal_category = 'Top-Bordprodukt (SkyTeam)'
      * Keine Allianz (z.B. EY, EK, GF, CZ, DE, KU, JX): deal_category = 'Top-Bordprodukt' (OHNE Allianz-Klammerzusatz!)
@@ -1948,6 +2645,9 @@ Inhalt: {clean_text[:5000]}
     )
     deal = normalize_and_verify_deal_mm_points(deal)
     deal.iata_via = resolve_deal_stops(deal)
+    deal.additional_destinations = normalize_additional_destinations(
+        deal.additional_destinations, deal.iata_destination
+    )
     is_ignored, ignored_air = is_deal_ignored_airline(deal, ignored_airlines)
     if is_ignored:
         deal.is_relevant = False
@@ -2046,17 +2746,29 @@ def build_telegram_message(
     if raw_advice and not any(kw in raw_advice.lower() for kw in forbidden_advice_keywords):
         advice_line = f"• <b>Besonderheiten:</b> {html.escape(raw_advice)}\n"
 
-    # Header & Preisangabe (bei Preissenkungen hervorheben)
+    # Header & Preisangabe (bei Preissenkungen & Wunschzielen hervorheben)
+    priority_dest_set = {
+        str(d).strip().upper()
+        for d in CONFIG.get("destinations", {}).get("priority_destinations", [])
+        if str(d).strip()
+    }
+    priority_suffix = " ⭐" if dest_code in priority_dest_set else ""
     category_label = resolve_deal_category(deal)
     if prev_price > 0 and prev_price > deal.price_eur:
-        header_line = f"📉 <b>PREIS-UPDATE: {html.escape(category_label)}</b>"
+        header_line = f"📉 <b>PREIS-UPDATE: {html.escape(category_label)}{priority_suffix}</b>"
         diff = prev_price - deal.price_eur
         price_line = f"• <b>Preis:</b> ~{deal.price_eur} € 📉 <i>(-{diff} € gegenüber bisher ~{prev_price} €!)</i> (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
     else:
-        header_line = f"✈️ <b>{html.escape(category_label)}</b>"
+        header_line = f"✈️ <b>{html.escape(category_label)}{priority_suffix}</b>"
         price_line = (
             f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
         )
+
+    extra_dests = normalize_additional_destinations(deal.additional_destinations, dest_code)
+    extra_dests_line = ""
+    if extra_dests:
+        formatted_dests = ", ".join(html.escape(d) for d in extra_dests)
+        extra_dests_line = f"• <b>Weitere Ziele im Sale:</b> {formatted_dests}\n"
 
     cabin_link_label = "First" if deal.detected_cabin_class == "First Class" else "Business"
 
@@ -2064,6 +2776,7 @@ def build_telegram_message(
         f"{header_line}\n\n"
         f"<b>{html.escape(title)}</b>\n\n"
         f"• <b>Route:</b> {route_str} ({html.escape(deal.airline_names)})\n"
+        f"{extra_dests_line}"
         f"{price_line}\n"
         f"{live_check_line}"
         f"• <b>Miles & More:</b> {deal.mm_points} Points | <b>{deal.mm_qualifying_points} QP</b>{ftl_info}\n"
@@ -2347,8 +3060,8 @@ def main():
                     if not raw_link:
                         continue
                     clean_link = normalize_url(raw_link)
-                    c.execute("SELECT 1 FROM seen_urls WHERE url_clean = ?", (clean_link,))
-                    if c.fetchone():
+                    entry_pub_utc = extract_entry_published_utc(entry)
+                    if not should_evaluate_url(conn, clean_link, entry_published_utc=entry_pub_utc, feed_url=feed_url):
                         continue
 
                     title = entry.get("title", "")
@@ -2357,34 +3070,32 @@ def main():
                         (content_list[0].get("value") if content_list else None) or entry.get("summary") or title
                     )
 
-                    # 1. Deterministischer Pre-Filter (Negativ-Keywords & Positiv-Gate für gemischte Feeds)
-                    is_eligible, pre_reason = is_feed_entry_eligible_pre_filter(title, raw_content, feed_url)
+                    # 1. Deterministischer Pre-Filter (URL-Pfadsegmente, Negativ-Keywords & Positiv-Gate für gemischte Feeds)
+                    is_eligible, pre_reason = is_feed_entry_eligible_pre_filter(
+                        title, raw_content, feed_url, entry_url=clean_link
+                    )
                     if not is_eligible:
                         logging.info(f"Eintrag im Pre-Filter verworfen ({pre_reason}): {title}")
-                        c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                        conn.commit()
+                        upsert_seen_url(conn, clean_link, entry_pub_utc)
                         continue
 
                     # Airline-Ignorier-Filter (Pre-Filter auf Titelebene)
                     is_ignored_title, matched_air = is_airline_ignored_in_text(title, IGNORED_AIRLINES)
                     if is_ignored_title:
                         logging.info(f"Eintrag vorab ignoriert (Airline im Titel: '{matched_air}'): {title}")
-                        c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                        conn.commit()
+                        upsert_seen_url(conn, clean_link, entry_pub_utc)
                         continue
 
                     # Initial Seeding Logik:
                     if is_new_db:
                         if seed_mode == "silent":
                             # Stummer Modus: Alle Deals still schlucken
-                            c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                            conn.commit()
+                            upsert_seen_url(conn, clean_link, entry_pub_utc)
                             continue
                         elif seed_mode == "eval_recent":
                             # Bewertet nur die ersten seed_max_deals Deals, restliche alte Einträge überspringen
                             if evaluated_seed_deals >= seed_max_deals:
-                                c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                                conn.commit()
+                                upsert_seen_url(conn, clean_link, entry_pub_utc)
                                 continue
 
                     full_text, sample_booking = get_enriched_deal_context(raw_content, raw_link)
@@ -2472,9 +3183,8 @@ def main():
                             f"Deal verworfen ({format_deal_route_plain(deal)}, {deal.price_eur}€, {deal.airline_names}): {reason}"
                         )
 
-                    # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL als gesehen speichern
-                    c.execute("INSERT INTO seen_urls (url_clean) VALUES (?)", (clean_link,))
-                    conn.commit()
+                    # Transaktionssicher: Erst nach erfolgreicher Verarbeitung URL inkl. RSS-Datum speichern/aktualisieren
+                    upsert_seen_url(conn, clean_link, entry_pub_utc)
                 except Exception as entry_err:
                     logging.error(f"Fehler bei Eintrag {entry.get('link', 'unbekannt')}: {entry_err}")
 

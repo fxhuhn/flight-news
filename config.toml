@@ -7,24 +7,27 @@
 home_airport = "HAM"
 
 # Bevorzugte Startflughäfen/Hubs (Direktabflüge oder unkomplizierte Zubringer ohne extra Positionierungsaufwand)
-preferred_hubs = ["HAM", "FRA", "BER", "CPH"]
+preferred_hubs = ["HAM", "FRA", "BER"]
 
 [destinations]
 # Erlaubte Zielregionen für Deals (Asien umfasst Ost-, Südost-, Süd- und Zentralasien)
 regions = ["Asien", "Zentralasien", "Südamerika", "Mittelamerika"]
 
-# Spezifische Nahost-/QP-Airports (Miles & More Interkontinental-Sweet-Spots: bringen 200 Points + 200 QP)
-sweet_spots = ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY"]
+# Spezifische Sweet-Spot-Airports: Nahost-/QP-Airports (Miles & More Interkontinental: 200 Points + 200 QP)
+# sowie Wunsch-Ziele außerhalb der Hauptregionen (Georgien: TBS Tiflis, BUS Batumi, KUT Kutaissi)
+sweet_spots = ["DXB", "DWC", "AUH", "JED", "RUH", "MCT", "SLL", "DOH", "AMM", "AQJ", "TLV", "BEY", "TBS", "BUS", "KUT"]
+
+# Persönliche Wunschziele (3-Letter IATA-Codes): Werden bei Sammel-Deals mit mehreren Zielen
+# bevorzugt als Hauptziel gewählt (inkl. Google-Flights-Link & eigenem Duplikat-Fingerprint)
+# und im Telegram-Push mit ⭐ hervorgehoben.
+priority_destinations = ["MNL", "KUL"]
 
 [pricing]
-# Maximalpreis in EUR Return ab den bevorzugten Hubs (HAM, FRA, BER, CPH)
-max_price_home_hubs = 2400
+# Maximalpreis in EUR Return ab den bevorzugten Hubs (HAM, FRA, BER)
+max_price_home_hubs = 2600
 
-# Maximalpreis in EUR Return für Ex-EU Abflüge (z.B. WAW, OSL, ARN, TLL, PRG, DUB, MXP, AMS, BUD)
-max_price_ex_eu = 1900
-
-# Maximalpreis in EUR Return für Ex-EU bei nachgewiesenen Top-Kabinen (z.B. Qsuite, Etihad A350/787, Turkish Airlines A350/787)
-max_price_top_cabin_ex_eu = 1950
+# Maximalpreis in EUR Return für alle übrigen europäischen Abflüge / Ex-EU (z.B. CPH, MUC, AMS, WAW, OSL, ARN, PRG, DUB, MXP, BUD)
+max_price_ex_eu = 2000
 
 [airlines]
 # Airlines, die bei den Angeboten ignoriert werden sollen (Ausschluss nach Name oder IATA-Code).
@@ -51,6 +54,9 @@ max_entries_per_feed = 25
 
 # Haltedauer (in Tagen) für gesendete Deals in sent_deals (Duplikatsperre & Preissturz-Historie)
 sent_deals_retention_days = 21
+
+# Recycelte Deal-URLs (z.B. Reisetopia) erneut prüfen, wenn das RSS-Veröffentlichungsdatum mind. X Tage neuer ist
+url_reeval_after_days = 7
 
 # Google Flights Live-Preis-Check (Soft-Check mit Fail-Open, inkl. optionalem Positionierungsflug)
 enable_google_flights_live_check = true
