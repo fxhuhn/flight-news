@@ -1,6 +1,7 @@
 import base64
 import calendar
 import html
+import json
 import logging
 import os
 import random
@@ -2240,6 +2241,71 @@ def _build_gf_positioning_query(origin: str, out_date: str, ret_date: str, home:
     )
 
 
+def extract_gf_lowest_price_from_html(html_text: str) -> int | None:
+    """
+    Extrahiert den günstigsten positiven EUR-Flugpreis robust aus einer Google-Flights-HTML-Antwort.
+    Liest direkt beide Ergebnislisten ('Beste Flüge' payload[2][0] und 'Weitere Flüge' payload[3][0])
+    aus dem eingebetteten 'script.ds:1'-JSON aus, ohne bei fehlenden CO2-/Metadaten-Feldern (None)
+    wie fast_flights.parser.parse abzustürzen. Fällt nur bei Bedarf auf parse_gf_html zurück.
+    """
+    if not html_text:
+        return None
+
+    prices: list[int] = []
+    try:
+        from selectolax.lexbor import LexborHTMLParser
+
+        parser = LexborHTMLParser(html_text)
+        script = parser.css_first(r"script.ds\:1")
+        if script is not None:
+            js_text = script.text()
+            if "data:" in js_text:
+                data = js_text.split("data:", 1)[1].rsplit(",", 1)[0].strip()
+                if data and not data.endswith("errorHasStatus: true"):
+                    payload = json.loads(data)
+                    if isinstance(payload, list):
+                        for bucket_idx in (2, 3):
+                            if len(payload) <= bucket_idx or not isinstance(payload[bucket_idx], list):
+                                continue
+                            bucket = payload[bucket_idx]
+                            itineraries = bucket[0] if bucket and isinstance(bucket[0], list) else None
+                            if not itineraries:
+                                continue
+                            for item in itineraries:
+                                if not isinstance(item, list) or len(item) < 2:
+                                    continue
+                                price_block = item[1]
+                                if (
+                                    isinstance(price_block, list)
+                                    and price_block
+                                    and isinstance(price_block[0], list)
+                                    and len(price_block[0]) >= 2
+                                ):
+                                    price = price_block[0][1]
+                                    if isinstance(price, int) and not isinstance(price, bool) and price > 0:
+                                        prices.append(price)
+    except Exception:
+        prices = []
+
+    if prices:
+        return min(prices)
+
+    # Sekundärer Fallback auf fast_flights-Parser (z.B. falls Google das Payload-Layout leicht ändert)
+    try:
+        results = parse_gf_html(html_text)
+        fallback_prices = [
+            f.price
+            for f in results
+            if isinstance(getattr(f, "price", None), int)
+            and not isinstance(getattr(f, "price", None), bool)
+            and f.price > 0
+        ]
+        return min(fallback_prices) if fallback_prices else None
+    except Exception as exc:
+        logging.info("Google Flights Live-Check Parsing fehlgeschlagen (Fail-Open): %s", exc)
+        return None
+
+
 def fetch_gf_lowest_price_eur(query: Query, timeout_seconds: int = GF_LIVE_CHECK_TIMEOUT_SECONDS) -> int | None:
     """Fragt Google Flights mit striktem Timeout und EU-Consent-Cookie ab und gibt den günstigsten Preis in EUR zurück (Fail-Open)."""
     try:
@@ -2256,9 +2322,7 @@ def fetch_gf_lowest_price_eur(query: Query, timeout_seconds: int = GF_LIVE_CHECK
             logging.info("Google Flights Live-Check lieferte HTTP %s", resp.status_code)
             return None
 
-        results = parse_gf_html(resp.text)
-        prices = [f.price for f in results if isinstance(getattr(f, "price", None), int) and f.price > 0]
-        return min(prices) if prices else None
+        return extract_gf_lowest_price_from_html(resp.text)
     except Exception as exc:
         logging.info("Google Flights Live-Check fehlgeschlagen (Fail-Open): %s", exc)
         return None

@@ -30,6 +30,7 @@ from bot import (
     ensure_valid_future_dates,
     evaluate_with_gemini,
     extract_entry_published_utc,
+    extract_gf_lowest_price_from_html,
     format_deal_route_plain,
     generate_with_gemini_fallback,
     init_db,
@@ -1425,3 +1426,41 @@ def test_afc_config_emits_no_sdk_warning(caplog):
         )
         assert _extra_utils.should_disable_afc(cfg) is True
     assert not any("automatic_function_calling" in rec.message for rec in caplog.records)
+
+
+def test_gf_html_price_extractor_handles_none_metadata_and_best_flights():
+    # Simuliert Google-Flights-HTML, bei dem fast_flights.parser.parse mit
+    # "'NoneType' object is not subscriptable" abstürzt (payload[7] = None, extras = None,
+    # einzelne Flüge ohne Preis) und Preise in 'Beste Flüge' (payload[2][0]) stehen.
+    payload_best_only = [
+        None,
+        None,
+        [
+            [
+                [["LO", ["LOT"], [], None, None], [[None, 168]]],
+                [["LH", ["Lufthansa"], [], None, None], [[None, 219]]],
+            ]
+        ],
+        [
+            [
+                [["EW", ["Eurowings"], []], [None]],  # fehlender Preisblock
+                [["LO", ["LOT"], []], [[None, 189]]],
+            ]
+        ],
+        None,
+        None,
+        None,
+        None,  # payload[7] = None -> lässt fast_flights.parser.parse abstürzen!
+    ]
+    import json as _json
+
+    html_doc = (
+        '<html><head><script class="ds:1">'
+        f"AF_initDataCallback({{key: 'ds:1', hash: '1', data:{_json.dumps(payload_best_only)}, sideChannel: {{}}}});"
+        "</script></head></html>"
+    )
+    assert extract_gf_lowest_price_from_html(html_doc) == 168
+
+    # Fehler-Status liefert sauber None statt Exception
+    err_html = '<html><head><script class="ds:1">AF_initDataCallback({data:null, errorHasStatus: true});</script></head></html>'
+    assert extract_gf_lowest_price_from_html(err_html) is None
