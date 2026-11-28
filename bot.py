@@ -3054,6 +3054,11 @@ def main():
             evaluated_seed_deals = 0
             consecutive_eval_failures = 0
             circuit_breaker_tripped = False
+            cycle_loaded = len(interleaved_entries)
+            cycle_known = 0
+            cycle_prefiltered = 0
+            cycle_ai = 0
+            cycle_pushed = 0
 
             # 3. Durchlaufe die ausgewogenen Einträge
             for entry, feed_url in interleaved_entries:
@@ -3070,6 +3075,7 @@ def main():
                     clean_link = normalize_url(raw_link)
                     entry_pub_utc = extract_entry_published_utc(entry)
                     if not should_evaluate_url(conn, clean_link, entry_published_utc=entry_pub_utc, feed_url=feed_url):
+                        cycle_known += 1
                         continue
 
                     title = entry.get("title", "")
@@ -3083,6 +3089,7 @@ def main():
                         title, raw_content, feed_url, entry_url=clean_link
                     )
                     if not is_eligible:
+                        cycle_prefiltered += 1
                         logging.info(f"Eintrag im Pre-Filter verworfen ({pre_reason}): {title}")
                         upsert_seen_url(conn, clean_link, entry_pub_utc)
                         continue
@@ -3090,6 +3097,7 @@ def main():
                     # Airline-Ignorier-Filter (Pre-Filter auf Titelebene)
                     is_ignored_title, matched_air = is_airline_ignored_in_text(title, IGNORED_AIRLINES)
                     if is_ignored_title:
+                        cycle_prefiltered += 1
                         logging.info(f"Eintrag vorab ignoriert (Airline im Titel: '{matched_air}'): {title}")
                         upsert_seen_url(conn, clean_link, entry_pub_utc)
                         continue
@@ -3110,6 +3118,7 @@ def main():
                     watchdog.beat(update_file=True)
 
                     try:
+                        cycle_ai += 1
                         deal = evaluate_with_gemini(client, title, full_text)
                         consecutive_eval_failures = 0
                     except Exception as gemini_err:
@@ -3168,6 +3177,7 @@ def main():
                                 live_check=live_check,
                             )
                             record_sent_deal(conn, deal)
+                            cycle_pushed += 1
                             if send_reason == "price_drop":
                                 logging.info(
                                     f"Deal-Preisupdate gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€ statt bisher {prev_price}€, {deal.airline_names})"
@@ -3213,7 +3223,11 @@ def main():
         if STOP_EVENT.is_set():
             break
 
-        logging.info(f"Zyklus abgeschlossen. Nächster Durchlauf in {CHECK_INTERVAL}s...")
+        logging.info(
+            f"Zyklus abgeschlossen: {cycle_loaded} geladen | {cycle_known} bekannt | "
+            f"{cycle_prefiltered} Pre-Filter | {cycle_ai} KI | {cycle_pushed} gepusht. "
+            f"Nächster Durchlauf in {CHECK_INTERVAL}s..."
+        )
         if wait_for_next_cycle(CHECK_INTERVAL, stop_event=STOP_EVENT, watchdog=watchdog):
             logging.info("Bot wurde gestoppt. Fahre geordnet herunter.")
             break
