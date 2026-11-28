@@ -166,6 +166,12 @@ def wait_for_next_cycle(
     return stop_event.is_set()
 
 
+def interruptible_sleep(seconds: float, stop_event: threading.Event | None = None) -> bool:
+    """Wartet unterbrechbar auf stop_event. Gibt True zurück, wenn ein Shutdown signalisiert wurde."""
+    evt = stop_event or STOP_EVENT
+    return evt.wait(timeout=max(0.0, float(seconds)))
+
+
 def create_genai_client(
     api_key: str = GEMINI_API_KEY,
     timeout_ms: int = GEMINI_HTTP_TIMEOUT_MS,
@@ -217,6 +223,8 @@ def load_config() -> dict[str, Any]:
                 "J2",
                 "Turkmenistan Airlines",
                 "T5",
+                "MIAT",
+                "Mongolian Airlines",
             ],
         },
         "system": {
@@ -250,6 +258,12 @@ HOME_AIRPORT: str = str(CONFIG["origin"].get("home_airport", "HAM")).strip().upp
 PREFERRED_HUBS: set[str] = {
     str(h).strip().upper() for h in CONFIG["origin"].get("preferred_hubs", ["HAM", "FRA", "BER"])
 }
+
+
+def get_preferred_hubs() -> set[str]:
+    """Liest die bevorzugten Start-Hubs konsistent und normalisiert aus CONFIG."""
+    raw_hubs = CONFIG.get("origin", {}).get("preferred_hubs", list(PREFERRED_HUBS))
+    return {normalize_airport_iata(str(h)) for h in raw_hubs if str(h).strip()}
 PRIORITY_DESTINATIONS: list[str] = [
     str(d).strip().upper()
     for d in CONFIG.get("destinations", {}).get("priority_destinations", ["MNL", "KUL"])
@@ -1547,7 +1561,8 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
     # 3. Origin-Verifikation (Origin-Hijacking verhindern)
     origin = (deal.iata_origin or "").upper().strip()
     combined_upper = f"{title} {full_text}".upper()
-    if origin and origin not in combined_upper:
+    origin_found = bool(origin and re.search(rf"\b{re.escape(origin)}\b", combined_upper))
+    if origin and not origin_found:
         airport_aliases = {
             "FRA": ["FRANKFURT"],
             "HAM": ["HAMBURG"],
@@ -1579,16 +1594,18 @@ def validate_deal_safety(deal: FlightDealEvaluation, title: str, full_text: str)
             "KEF": ["REYKJAVIK", "KEFLAVIK"],
         }
         aliases = airport_aliases.get(origin, [])
-        if not any(alias in combined_upper for alias in aliases):
+
+        def _alias_matches(alias: str) -> bool:
+            if len(alias) <= 4:
+                return bool(re.search(rf"\b{re.escape(alias)}\b", combined_upper))
+            return bool(re.search(rf"\b{re.escape(alias)}", combined_upper))
+
+        if not any(_alias_matches(alias) for alias in aliases):
             return False, f"Abflughafen {origin} kommt im Deal-Text nicht vor (Origin-Hijacking abgefangen)"
 
     # 4. Europa-Origin-Pflicht (Hybrid: Negativliste -> Europa-Fast-Path -> Schema-Flag)
     norm_origin = normalize_airport_iata(origin)
-    hubs_set = {
-        normalize_airport_iata(str(h))
-        for h in CONFIG.get("origin", {}).get("preferred_hubs", list(PREFERRED_HUBS))
-        if str(h).strip()
-    }
+    hubs_set = get_preferred_hubs()
     if norm_origin in NON_EUROPE_ORIGIN_AIRPORTS:
         return False, f"Startflughafen {norm_origin} liegt außerhalb Europas"
     if norm_origin and norm_origin not in KNOWN_EUROPE_AIRPORTS and norm_origin not in hubs_set:
@@ -1715,7 +1732,12 @@ def close_db(conn: sqlite3.Connection | None) -> None:
         conn.close()
 
 
-def cleanup_db(conn: sqlite3.Connection, sent_deals_retention_days: int | None = None) -> None:
+def cleanup_db(
+    conn: sqlite3.Connection,
+    sent_deals_retention_days: int | None = None,
+    vacuum_threshold: int = 50,
+    force_vacuum: bool = False,
+) -> None:
     retention_days = max(
         1,
         int(SENT_DEALS_RETENTION_DAYS if sent_deals_retention_days is None else sent_deals_retention_days),
@@ -1730,7 +1752,7 @@ def cleanup_db(conn: sqlite3.Connection, sent_deals_retention_days: int | None =
         )
         deleted_deals = max(0, c.rowcount)
     conn.commit()
-    if (deleted_urls + deleted_deals) > 0:
+    if force_vacuum or (deleted_urls + deleted_deals) >= max(1, int(vacuum_threshold)):
         conn.execute("VACUUM;")
     checkpoint_db(conn)
 
@@ -1983,9 +2005,9 @@ def get_enriched_deal_context(raw_content: str, article_url: str = "") -> tuple[
     """
     feed_text, sample_booking = extract_deal_context(raw_content)
 
-    # Wenn der Feed bereits einen ausführlichen Volltext liefert (>= 1.200 Zeichen)
-    # und bereits ein Buchungslink vorhanden ist, ist kein zusätzliches Scraping nötig (z.B. Travel Dealz).
-    if len(feed_text) >= 1200 and sample_booking:
+    # Wenn der Feed bereits einen ausführlichen Volltext liefert (>= 1.200 Zeichen mit Buchungslink,
+    # >= 1.800 Zeichen Volltext oder ausführlicher Foren-Beitrag), ist kein zusätzliches Scraping nötig.
+    if len(feed_text) >= 1200 and (sample_booking or len(feed_text) >= 1800 or is_forum_url(article_url)):
         return feed_text, sample_booking
 
     # Falls Ziel-URL vorhanden ist, Artikel abrufen und per Trafilatura extrahieren
@@ -2306,18 +2328,31 @@ def extract_gf_lowest_price_from_html(html_text: str) -> int | None:
         return None
 
 
-def fetch_gf_lowest_price_eur(query: Query, timeout_seconds: int = GF_LIVE_CHECK_TIMEOUT_SECONDS) -> int | None:
+def fetch_gf_lowest_price_eur(
+    query: Query,
+    timeout_seconds: int = GF_LIVE_CHECK_TIMEOUT_SECONDS,
+    cffi_session: Any | None = None,
+) -> int | None:
     """Fragt Google Flights mit striktem Timeout und EU-Consent-Cookie ab und gibt den günstigsten Preis in EUR zurück (Fail-Open)."""
     try:
-        from curl_cffi import requests as cffi_requests
+        if cffi_session is not None:
+            resp = cffi_session.get(
+                "https://www.google.com/travel/flights/search",
+                params=query.params(),
+                impersonate="chrome124",
+                timeout=timeout_seconds,
+                cookies=_GF_CONSENT_COOKIES,
+            )
+        else:
+            from curl_cffi import requests as cffi_requests
 
-        resp = cffi_requests.get(
-            "https://www.google.com/travel/flights/search",
-            params=query.params(),
-            impersonate="chrome124",
-            timeout=timeout_seconds,
-            cookies=_GF_CONSENT_COOKIES,
-        )
+            resp = cffi_requests.get(
+                "https://www.google.com/travel/flights/search",
+                params=query.params(),
+                impersonate="chrome124",
+                timeout=timeout_seconds,
+                cookies=_GF_CONSENT_COOKIES,
+            )
         if resp.status_code != 200 or not resp.text:
             logging.info("Google Flights Live-Check lieferte HTTP %s", resp.status_code)
             return None
@@ -2341,9 +2376,23 @@ def run_google_flights_live_check(
        direkt am Deal aktualisiert, damit alle Links auf den bestätigten Termin zeigen.
     2. Prüft bei Ex-EU-Deals zusätzlich den günstigsten Live-Preis für den Positionierungsflug ab HOME_AIRPORT.
     """
-    fetcher = price_fetcher or fetch_gf_lowest_price_eur
+    gf_session: Any | None = None
+    if price_fetcher is not None:
+        fetcher = price_fetcher
+    else:
+        try:
+            from curl_cffi import requests as cffi_requests
+
+            gf_session = cffi_requests.Session()
+        except Exception:
+            gf_session = None
+
+        def fetcher(q: Query) -> int | None:
+            return fetch_gf_lowest_price_eur(q, cffi_session=gf_session)
+
     home_hub = normalize_airport_iata(home or HOME_AIRPORT)
     origin = normalize_airport_iata(deal.iata_origin)
+    preferred_hubs = get_preferred_hubs()
     base_out, base_ret = ensure_valid_future_dates(
         deal.sample_outbound_date, deal.sample_return_date, reference_date=reference_date
     )
@@ -2365,43 +2414,63 @@ def run_google_flights_live_check(
     best_ret = base_ret
 
     try:
-        for offset_days in (0, 14, 28):
-            cand_out = (base_out_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
-            cand_ret = (base_ret_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
-            q_main = _build_gf_main_query(deal, cand_out, cand_ret)
-            price = fetcher(q_main)
-            if price is not None and (best_price is None or price < best_price):
-                best_price = price
-                best_out = cand_out
-                best_ret = cand_ret
-            if price is not None and (max_match_price <= 0 or price <= max_match_price):
-                break
-
-        if best_price is not None:
-            result.main_price_eur = best_price
-            result.main_outbound_date = best_out
-            result.main_return_date = best_ret
-            result.price_matches_deal = max_match_price <= 0 or best_price <= max_match_price
-            # Übernehme den günstigsten gefundenen Termin direkt auf den Deal für Haupt- & Positionierungslink
-            deal.sample_outbound_date = best_out
-            deal.sample_return_date = best_ret
-    except Exception as exc:
-        result.error = str(exc)
-        logging.info("Hauptflug Live-Check abgebrochen (Fail-Open): %s", exc)
-
-    # Optionaler Positionierungsflug (nur bei Ex-EU Abflug außerhalb der bevorzugten Hubs)
-    if origin and origin not in PREFERRED_HUBS and origin != home_hub:
-        result.positioning_origin = home_hub
-        result.positioning_destination = origin
         try:
-            q_pos = _build_gf_positioning_query(
-                origin, result.main_outbound_date, result.main_return_date, home=home_hub
-            )
-            result.positioning_price_eur = fetcher(q_pos)
+            for offset_days in (0, 14, 28):
+                cand_out = (base_out_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+                cand_ret = (base_ret_dt + timedelta(days=offset_days)).strftime("%Y-%m-%d")
+                q_main = _build_gf_main_query(deal, cand_out, cand_ret)
+                price = fetcher(q_main)
+                if price is not None and (best_price is None or price < best_price):
+                    best_price = price
+                    best_out = cand_out
+                    best_ret = cand_ret
+                if price is not None and (max_match_price <= 0 or price <= max_match_price):
+                    break
+
+            if best_price is not None:
+                result.main_price_eur = best_price
+                result.main_outbound_date = best_out
+                result.main_return_date = best_ret
+                result.price_matches_deal = max_match_price <= 0 or best_price <= max_match_price
+                # Übernehme den günstigsten gefundenen Termin direkt auf den Deal für Haupt- & Positionierungslink
+                deal.sample_outbound_date = best_out
+                deal.sample_return_date = best_ret
         except Exception as exc:
-            logging.info("Positionierungsflug Live-Check abgebrochen (Fail-Open): %s", exc)
+            result.error = str(exc)
+            logging.info("Hauptflug Live-Check abgebrochen (Fail-Open): %s", exc)
+
+        # Optionaler Positionierungsflug (nur bei Ex-EU Abflug außerhalb der bevorzugten Hubs)
+        if origin and origin not in preferred_hubs and origin != home_hub:
+            result.positioning_origin = home_hub
+            result.positioning_destination = origin
+            try:
+                q_pos = _build_gf_positioning_query(
+                    origin, result.main_outbound_date, result.main_return_date, home=home_hub
+                )
+                result.positioning_price_eur = fetcher(q_pos)
+            except Exception as exc:
+                logging.info("Positionierungsflug Live-Check abgebrochen (Fail-Open): %s", exc)
+    finally:
+        if gf_session is not None:
+            try:
+                gf_session.close()
+            except Exception:
+                pass
 
     return result
+
+
+GEMINI_MODEL_COOLDOWN_UNTIL: dict[str, float] = {}
+_GEMINI_COOLDOWN_LOCK = threading.Lock()
+GEMINI_NOT_FOUND_COOLDOWN_SECONDS = 3600
+GEMINI_DAILY_QUOTA_COOLDOWN_SECONDS = 1800
+
+
+def clear_gemini_model_cooldowns(cooldowns: dict[str, float] | None = None) -> None:
+    """Leert den Gemini-Modell-Cooldown-Cache (z.B. für isolierte Unit-Tests)."""
+    target = GEMINI_MODEL_COOLDOWN_UNTIL if cooldowns is None else cooldowns
+    with _GEMINI_COOLDOWN_LOCK:
+        target.clear()
 
 
 def generate_with_gemini_fallback(
@@ -2412,8 +2481,10 @@ def generate_with_gemini_fallback(
     enable_thinking: bool = False,
     max_transient_retries: int = 4,
     http_timeout_ms: int = GEMINI_HTTP_TIMEOUT_MS,
+    model_cooldowns: dict[str, float] | None = None,
+    stop_event: threading.Event | None = None,
 ) -> Any:
-    """Führt Content-Generierung mit automatischer Modell-Kaskade, striktem HTTP-Timeout und Retry-Logik aus."""
+    """Führt Content-Generierung mit automatischer Modell-Kaskade, Cooldown-Cache, striktem HTTP-Timeout und Retry-Logik aus."""
     fallback_models = [preferred_model]
     for fb in [
         "gemini-3.8-flash",
@@ -2426,7 +2497,11 @@ def generate_with_gemini_fallback(
         if fb not in fallback_models:
             fallback_models.append(fb)
 
-    candidate_models = list(fallback_models)
+    cooldown_map = GEMINI_MODEL_COOLDOWN_UNTIL if model_cooldowns is None else model_cooldowns
+    now_mono = time.monotonic()
+    with _GEMINI_COOLDOWN_LOCK:
+        active_models = [m for m in fallback_models if cooldown_map.get(m, 0.0) <= now_mono]
+    candidate_models = active_models if active_models else list(fallback_models)
     transient_attempt = 0
     transient_delays = [10, 25, 45, 60]
 
@@ -2476,16 +2551,19 @@ def generate_with_gemini_fallback(
                     exc = inner_exc
                     exc_str = str(inner_exc)
 
-            # Fall B: Modell existiert nicht / veraltet (404 Not Found) -> sofort nächstes Modell
+            # Fall B: Modell existiert nicht / veraltet (404 Not Found) -> Cooldown & sofort nächstes Modell
             is_not_found = (isinstance(exc, errors.APIError) and exc.code == 404) or (
                 "404" in exc_str or "NOT_FOUND" in exc_str
             )
 
             if is_not_found:
                 logging.warning(
-                    "Modell %s nicht verfügbar (404). Schalte auf nächstes Modell um...",
+                    "Modell %s nicht verfügbar (404). Setze Cooldown (%ds) und schalte auf nächstes Modell um...",
                     current_model,
+                    GEMINI_NOT_FOUND_COOLDOWN_SECONDS,
                 )
+                with _GEMINI_COOLDOWN_LOCK:
+                    cooldown_map[current_model] = time.monotonic() + GEMINI_NOT_FOUND_COOLDOWN_SECONDS
                 candidate_models.pop(0)
                 if not candidate_models:
                     raise
@@ -2519,11 +2597,14 @@ def generate_with_gemini_fallback(
                 retry_match = re.search(r"retry.*?(\d+(?:\.\d+)?)\s*s", exc_str, re.IGNORECASE)
                 retry_h_match = re.search(r"retry.*?(\d+)\s*h", exc_str, re.IGNORECASE)
                 if retry_h_match or (retry_match and float(retry_match.group(1)) > 65):
-                    # Tägliches Limit für dieses Modell erschöpft (>65s) -> sofort Modell aus der Liste werfen
+                    # Tägliches Limit für dieses Modell erschöpft (>65s) -> Cooldown & sofort nächstes Modell
                     logging.warning(
-                        "Tageskontingent für Modell %s erschöpft. Wechsle sofort auf nächstes Modell...",
+                        "Tageskontingent für Modell %s erschöpft. Setze Cooldown (%ds) und wechsle sofort auf nächstes Modell...",
                         current_model,
+                        GEMINI_DAILY_QUOTA_COOLDOWN_SECONDS,
                     )
+                    with _GEMINI_COOLDOWN_LOCK:
+                        cooldown_map[current_model] = time.monotonic() + GEMINI_DAILY_QUOTA_COOLDOWN_SECONDS
                     candidate_models.pop(0)
                     if not candidate_models:
                         raise exc
@@ -2550,7 +2631,8 @@ def generate_with_gemini_fallback(
                     next_model,
                     sleep_time,
                 )
-                time.sleep(sleep_time)
+                if interruptible_sleep(sleep_time, stop_event=stop_event):
+                    raise RuntimeError("Gemini-Retry wegen Shutdown abgebrochen.")
             else:
                 raise
 
@@ -2739,6 +2821,13 @@ def _format_short_date_range(out_date: str, ret_date: str) -> str:
         return f"{out_date}–{ret_date}"
 
 
+def _truncate_text(text: str, max_len: int) -> str:
+    cleaned = (text or "").strip()
+    if len(cleaned) <= max_len:
+        return cleaned
+    return cleaned[: max(1, max_len - 1)].rstrip() + "…"
+
+
 def build_telegram_message(
     deal: FlightDealEvaluation,
     title: str,
@@ -2749,9 +2838,10 @@ def build_telegram_message(
 ) -> str:
     origin_code = normalize_airport_iata(deal.iata_origin)
     dest_code = normalize_airport_iata(deal.iata_destination)
+    preferred_hubs = get_preferred_hubs()
     gf_main = build_gf_main_url(deal)
     pos_line = ""
-    if origin_code not in PREFERRED_HUBS:
+    if origin_code not in preferred_hubs:
         gf_pos = build_positioning_url(
             origin_code, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
         )
@@ -2816,7 +2906,7 @@ def build_telegram_message(
         "skyscanner",
     ]
     if raw_advice and not any(kw in raw_advice.lower() for kw in forbidden_advice_keywords):
-        advice_line = f"• <b>Besonderheiten:</b> {html.escape(raw_advice)}\n"
+        advice_line = f"• <b>Besonderheiten:</b> {html.escape(_truncate_text(raw_advice, 400))}\n"
 
     # Header & Preisangabe (bei Preissenkungen & Wunschzielen hervorheben)
     priority_dest_set = {
@@ -2839,20 +2929,23 @@ def build_telegram_message(
     extra_dests = normalize_additional_destinations(deal.additional_destinations, dest_code)
     extra_dests_line = ""
     if extra_dests:
-        formatted_dests = ", ".join(html.escape(d) for d in extra_dests)
+        formatted_dests = ", ".join(html.escape(_truncate_text(d, 40)) for d in extra_dests)
         extra_dests_line = f"• <b>Weitere Ziele im Sale:</b> {formatted_dests}\n"
 
     cabin_link_label = "First" if deal.detected_cabin_class == "First Class" else "Business"
+    safe_title = html.escape(_truncate_text(title, 240))
+    safe_airline_names = html.escape(_truncate_text(deal.airline_names, 120))
+    safe_cabin_assessment = html.escape(_truncate_text(deal.cabin_assessment, 160))
 
     msg = (
         f"{header_line}\n\n"
-        f"<b>{html.escape(title)}</b>\n\n"
-        f"• <b>Route:</b> {route_str} ({html.escape(deal.airline_names)})\n"
+        f"<b>{safe_title}</b>\n\n"
+        f"• <b>Route:</b> {route_str} ({safe_airline_names})\n"
         f"{extra_dests_line}"
         f"{price_line}\n"
         f"{live_check_line}"
         f"• <b>Miles & More:</b> {deal.mm_points} Points | <b>{deal.mm_qualifying_points} QP</b>{ftl_info}\n"
-        f"• <b>Bordprodukt:</b> {html.escape(deal.cabin_assessment)}\n"
+        f"• <b>Bordprodukt:</b> {safe_cabin_assessment}\n"
         f"{advice_line}\n"
         f"🔗 <b>Direktlinks:</b>\n"
         f'🔹 <a href="{html.escape(url, quote=True)}">Deal-Quelle & Tarifdetails</a>\n'
@@ -2871,23 +2964,107 @@ def send_telegram(
     session: requests.Session | None = None,
     prev_price: int = 0,
     live_check: GoogleFlightsLiveCheckResult | None = None,
-):
+    stop_event: threading.Event | None = None,
+) -> None:
     msg = build_telegram_message(deal, title, url, sample_booking, prev_price=prev_price, live_check=live_check)
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     s = session or SESSION
-    for attempt in range(3):
-        resp = s.post(
-            tg_url,
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=15,
-        )
-        if resp.status_code == 429:
-            retry_after = int(resp.json().get("parameters", {}).get("retry_after", 10))
-            logging.warning(f"Telegram Rate Limit. Warte {retry_after}s...")
-            time.sleep(retry_after)
+    max_attempts = 4
+    backoff_delays = (2, 5, 10)
+    non_idempotent_retries = 0
+
+    for attempt in range(max_attempts):
+        try:
+            resp = s.post(
+                tg_url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+                timeout=15,
+            )
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as exc:
+            if attempt + 1 >= max_attempts:
+                raise
+            delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+            logging.warning(
+                "Telegram-Verbindungsfehler (Versuch %d/%d): %s. Retry in %ds...",
+                attempt + 1,
+                max_attempts,
+                exc,
+                delay,
+            )
+            if interruptible_sleep(delay, stop_event=stop_event):
+                raise RuntimeError("Telegram-Versand wegen Shutdown abgebrochen.") from exc
             continue
+        except requests.RequestException as exc:
+            # ReadTimeout o.ä. ist bei POST /sendMessage nicht garantiert idempotent -> max. 1 Retry
+            if non_idempotent_retries >= 1 or attempt + 1 >= max_attempts:
+                raise
+            non_idempotent_retries += 1
+            delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+            logging.warning(
+                "Telegram-Request-Fehler (Versuch %d/%d): %s. Einmaliger Retry in %ds...",
+                attempt + 1,
+                max_attempts,
+                exc,
+                delay,
+            )
+            if interruptible_sleep(delay, stop_event=stop_event):
+                raise RuntimeError("Telegram-Versand wegen Shutdown abgebrochen.") from exc
+            continue
+
+        if resp.status_code == 429:
+            retry_after = 10
+            try:
+                raw_retry = resp.json().get("parameters", {}).get("retry_after", 10)
+                retry_after = max(1, min(60, int(raw_retry)))
+            except (ValueError, TypeError, AttributeError):
+                retry_after = 10
+            if attempt + 1 >= max_attempts:
+                resp.raise_for_status()
+                raise RuntimeError(f"Telegram Rate Limit (429) nach {max_attempts} Versuchen nicht überwunden.")
+            logging.warning(
+                "Telegram Rate Limit (429, Versuch %d/%d). Warte %ds...",
+                attempt + 1,
+                max_attempts,
+                retry_after,
+            )
+            if interruptible_sleep(retry_after, stop_event=stop_event):
+                raise RuntimeError("Telegram-Versand wegen Shutdown abgebrochen.")
+            continue
+
+        if resp.status_code == 503:
+            if attempt + 1 >= max_attempts:
+                resp.raise_for_status()
+            delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+            logging.warning(
+                "Telegram temporär nicht erreichbar (HTTP 503, Versuch %d/%d). Retry in %ds...",
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            if interruptible_sleep(delay, stop_event=stop_event):
+                raise RuntimeError("Telegram-Versand wegen Shutdown abgebrochen.")
+            continue
+
+        if resp.status_code in (500, 502, 504):
+            if non_idempotent_retries >= 1 or attempt + 1 >= max_attempts:
+                resp.raise_for_status()
+            non_idempotent_retries += 1
+            delay = backoff_delays[min(attempt, len(backoff_delays) - 1)]
+            logging.warning(
+                "Telegram Gateway-Fehler (HTTP %d, Versuch %d/%d). Einmaliger Retry in %ds...",
+                resp.status_code,
+                attempt + 1,
+                max_attempts,
+                delay,
+            )
+            if interruptible_sleep(delay, stop_event=stop_event):
+                raise RuntimeError("Telegram-Versand wegen Shutdown abgebrochen.")
+            continue
+
         resp.raise_for_status()
         return
+
+    raise RuntimeError("Telegram-Versand nach allen Wiederholungsversuchen fehlgeschlagen.")
 
 
 def fetch_flynous_synthetic_rss() -> str:
@@ -2981,16 +3158,41 @@ def fetch_secretflying_synthetic_rss() -> str:
         return ""
 
 
-def fetch_feed_content(feed_url: str, session: requests.Session | None = None) -> str:
+FEED_HTTP_CACHE: dict[str, dict[str, str]] = {}
+_FEED_HTTP_CACHE_LOCK = threading.Lock()
+_FEED_UNCHANGED_SENTINEL = "__FEED_UNCHANGED_304__"
+
+
+def fetch_feed_content(
+    feed_url: str,
+    session: requests.Session | None = None,
+    http_cache: dict[str, dict[str, str]] | None = None,
+) -> str:
     if "flynous.com" in feed_url:
         return fetch_flynous_synthetic_rss()
     if "secretflying.com" in feed_url:
         return fetch_secretflying_synthetic_rss()
 
     s = session or SESSION
+    cache = FEED_HTTP_CACHE if http_cache is None else http_cache
+    req_headers = dict(HEADERS)
+    with _FEED_HTTP_CACHE_LOCK:
+        cached_meta = dict(cache.get(feed_url, {}))
+    if cached_meta.get("etag"):
+        req_headers["If-None-Match"] = cached_meta["etag"]
+    if cached_meta.get("last_modified"):
+        req_headers["If-Modified-Since"] = cached_meta["last_modified"]
+
     try:
-        resp = s.get(feed_url, headers=HEADERS, timeout=15)
+        resp = s.get(feed_url, headers=req_headers, timeout=15)
+        if resp.status_code == 304:
+            return _FEED_UNCHANGED_SENTINEL
         if resp.status_code == 200 and ("<rss" in resp.text or "<feed" in resp.text or "<?xml" in resp.text):
+            etag = resp.headers.get("ETag", "").strip() if getattr(resp, "headers", None) else ""
+            last_mod = resp.headers.get("Last-Modified", "").strip() if getattr(resp, "headers", None) else ""
+            if etag or last_mod:
+                with _FEED_HTTP_CACHE_LOCK:
+                    cache[feed_url] = {k: v for k, v in (("etag", etag), ("last_modified", last_mod)) if v}
             return resp.text
         logging.warning(f"Feed-Abruf unerwarteter Status/Inhalt für {feed_url}: {resp.status_code}")
     except Exception as e:
@@ -3003,20 +3205,26 @@ def fetch_all_feeds(
     max_workers: int | None = None,
     session: requests.Session | None = None,
     max_entries_per_feed: int | None = None,
+    http_cache: dict[str, dict[str, str]] | None = None,
 ) -> list[tuple[str, list[dict[str, Any]]]]:
     """
     Lädt alle Feeds parallel mit ThreadPoolExecutor herunter und bewahrt die Feed-Reihenfolge.
+    Nutzt pro Worker-Thread eine eigene Session (thread-safe) sowie Conditional Requests (ETag / If-Modified-Since).
     Verifiziert jeden Feed auf Erreichbarkeit & Inhalt und dokumentiert den Health-Status im Log.
     """
-    s = session or SESSION
     limit = max_entries_per_feed if max_entries_per_feed is not None else MAX_ENTRIES_PER_FEED
-    workers = max_workers or len(feed_urls)
+    workers = max(1, max_workers or len(feed_urls))
     results_map: dict[str, list[dict[str, Any]]] = {}
+    status_map: dict[str, str] = {}
     feed_issues: list[str] = []
 
     def _fetch_one(u: str) -> tuple[str, list[dict[str, Any]], str]:
+        owned_session = create_http_session() if session is None else None
+        active_session = session or owned_session
         try:
-            raw_xml = fetch_feed_content(u, session=s)
+            raw_xml = fetch_feed_content(u, session=active_session, http_cache=http_cache)
+            if raw_xml == _FEED_UNCHANGED_SENTINEL:
+                return (u, [], "unchanged")
             if not raw_xml:
                 return (u, [], "Abruf fehlgeschlagen / leerer Inhalt")
             feed = feedparser.parse(raw_xml)
@@ -3027,26 +3235,32 @@ def fetch_all_feeds(
         except Exception as feed_err:
             logging.error(f"Fehler beim Parsen von Feed {u}: {feed_err}")
             return (u, [], str(feed_err))
+        finally:
+            if owned_session is not None:
+                owned_session.close()
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(_fetch_one, url): url for url in feed_urls}
         for future in as_completed(futures):
             url, entries, status = future.result()
             results_map[url] = entries
-            if status != "ok":
+            status_map[url] = status
+            if status not in ("ok", "unchanged"):
                 feed_issues.append(f"{url} [{status}]")
 
     total_feeds = len(feed_urls)
-    active_feeds = len([u for u in feed_urls if results_map.get(u)])
+    active_feeds = sum(1 for u in feed_urls if status_map.get(u) in ("ok", "unchanged"))
+    unchanged_feeds = sum(1 for u in feed_urls if status_map.get(u) == "unchanged")
     total_entries = sum(len(entries) for entries in results_map.values())
+    unchanged_suffix = f", {unchanged_feeds} unverändert / 304" if unchanged_feeds > 0 else ""
 
     if active_feeds == total_feeds:
         logging.info(
-            f"Feed-Scan erfolgreich: {active_feeds}/{total_feeds} Feeds aktiv ({total_entries} Einträge geladen)."
+            f"Feed-Scan erfolgreich: {active_feeds}/{total_feeds} Feeds aktiv ({total_entries} Einträge geladen{unchanged_suffix})."
         )
     else:
         logging.warning(
-            f"Feed-Scan unvollständig: {active_feeds}/{total_feeds} Feeds aktiv. "
+            f"Feed-Scan unvollständig: {active_feeds}/{total_feeds} Feeds aktiv{unchanged_suffix}. "
             f"Auffällige Feeds ({len(feed_issues)}): {', '.join(feed_issues)}"
         )
 
@@ -3085,12 +3299,21 @@ def main():
 
     is_new_db = False
     first_cycle = True
+    consecutive_cycle_errors = 0
 
     while not STOP_EVENT.is_set():
         watchdog.beat(update_file=True)
-        conn = init_db()
-        c = conn.cursor()
+        conn: sqlite3.Connection | None = None
+        c: sqlite3.Cursor | None = None
+        cycle_succeeded = False
+        cycle_loaded = 0
+        cycle_known = 0
+        cycle_prefiltered = 0
+        cycle_ai = 0
+        cycle_pushed = 0
         try:
+            conn = init_db()
+            c = conn.cursor()
             if first_cycle:
                 c.execute("SELECT COUNT(*) FROM seen_urls")
                 is_new_db = c.fetchone()[0] == 0
@@ -3119,10 +3342,6 @@ def main():
             consecutive_eval_failures = 0
             circuit_breaker_tripped = False
             cycle_loaded = len(interleaved_entries)
-            cycle_known = 0
-            cycle_prefiltered = 0
-            cycle_ai = 0
-            cycle_pushed = 0
 
             # 3. Durchlaufe die ausgewogenen Einträge
             for entry, feed_url in interleaved_entries:
@@ -3250,7 +3469,7 @@ def main():
                                 logging.info(
                                     f"Neuer Deal gepusht: {fingerprint} [{format_deal_route_plain(deal)}] ({deal.price_eur}€, {deal.airline_names})"
                                 )
-                            time.sleep(2)
+                            interruptible_sleep(2)
                         else:
                             logging.info(
                                 f"Cross-Feed-Duplikat unterdrückt: {fingerprint} ({deal.price_eur}€, bestehend: {prev_price}€)"
@@ -3273,8 +3492,21 @@ def main():
             if is_new_db and not circuit_breaker_tripped:
                 logging.info("Initialer Start-Zyklus erfolgreich abgeschlossen. Live-Überwachung aktiv.")
                 is_new_db = False
+            cycle_succeeded = True
+            consecutive_cycle_errors = 0
+        except Exception as cycle_err:
+            consecutive_cycle_errors += 1
+            logging.exception(
+                "Unerwarteter Fehler im Verarbeitungszyklus (%d in Folge): %s",
+                consecutive_cycle_errors,
+                cycle_err,
+            )
         finally:
-            c.close()
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
             close_db(conn)
 
         # Heartbeat nach jedem Zyklus aktualisieren
@@ -3287,12 +3519,21 @@ def main():
         if STOP_EVENT.is_set():
             break
 
-        logging.info(
-            f"Zyklus abgeschlossen: {cycle_loaded} geladen | {cycle_known} bekannt | "
-            f"{cycle_prefiltered} Pre-Filter | {cycle_ai} KI | {cycle_pushed} gepusht. "
-            f"Nächster Durchlauf in {CHECK_INTERVAL}s..."
-        )
-        if wait_for_next_cycle(CHECK_INTERVAL, stop_event=STOP_EVENT, watchdog=watchdog):
+        if cycle_succeeded:
+            wait_seconds = CHECK_INTERVAL
+            logging.info(
+                f"Zyklus abgeschlossen: {cycle_loaded} geladen | {cycle_known} bekannt | "
+                f"{cycle_prefiltered} Pre-Filter | {cycle_ai} KI | {cycle_pushed} gepusht. "
+                f"Nächster Durchlauf in {wait_seconds}s..."
+            )
+        else:
+            wait_seconds = min(CHECK_INTERVAL, 60 * (2 ** min(consecutive_cycle_errors - 1, 5)))
+            logging.warning(
+                "Zyklus nach Fehler pausiert. Nächster Versuch mit Backoff in %ds...",
+                wait_seconds,
+            )
+
+        if wait_for_next_cycle(wait_seconds, stop_event=STOP_EVENT, watchdog=watchdog):
             logging.info("Bot wurde gestoppt. Fahre geordnet herunter.")
             break
 

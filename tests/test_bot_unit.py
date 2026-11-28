@@ -25,14 +25,17 @@ from bot import (
     checkpoint_db,
     clean_html,
     cleanup_db,
+    clear_gemini_model_cooldowns,
     close_db,
     create_genai_client,
     ensure_valid_future_dates,
     evaluate_with_gemini,
     extract_entry_published_utc,
     extract_gf_lowest_price_from_html,
+    fetch_all_feeds,
     format_deal_route_plain,
     generate_with_gemini_fallback,
+    get_enriched_deal_context,
     init_db,
     is_airline_ignored_in_text,
     is_deal_ignored_airline,
@@ -47,6 +50,7 @@ from bot import (
     resolve_deal_category,
     resolve_deal_stops,
     run_google_flights_live_check,
+    send_telegram,
     should_evaluate_url,
     should_send_deal,
     should_trip_circuit_breaker,
@@ -643,13 +647,14 @@ def test_genai_client_timeout_and_fallback_resilience():
 
     mock_client.models.generate_content.side_effect = side_effect
 
-    with patch("bot.time.sleep"):
+    with patch("bot.interruptible_sleep", return_value=False):
         resp = generate_with_gemini_fallback(
             client=mock_client,
             prompt="Test Prompt",
             response_schema=FlightDealEvaluation,
             preferred_model="gemini-3.8-flash",
             http_timeout_ms=30_000,
+            model_cooldowns={},
         )
 
     assert resp.text == "ok"
@@ -1464,3 +1469,301 @@ def test_gf_html_price_extractor_handles_none_metadata_and_best_flights():
     # Fehler-Status liefert sauber None statt Exception
     err_html = '<html><head><script class="ds:1">AF_initDataCallback({data:null, errorHasStatus: true});</script></head></html>'
     assert extract_gf_lowest_price_from_html(err_html) is None
+
+
+def test_send_telegram_retries_and_no_silent_drop():
+    deal = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="SWISS Business Class ab Frankfurt nach Bangkok",
+        is_relevant=True,
+        deal_category="FTL-Booster (Points + QP)",
+        airline_names="SWISS (LX)",
+        primary_airline_iata="LX",
+        iata_origin="FRA",
+        iata_via=["ZRH"],
+        iata_destination="BKK",
+        is_open_jaw=False,
+        iata_return_end="FRA",
+        region="Asien",
+        sample_outbound_date="2027-02-10",
+        sample_return_date="2027-02-24",
+        price_eur=1790,
+        booking_class="P",
+        mm_points=480,
+        mm_qualifying_points=480,
+        cabin_assessment="X" * 300,
+        routing_advice="Auch ab MUC buchbar. " + ("Detail " * 100),
+        rejection_reason="",
+    )
+
+    # 1. Pre-Escape-Kappung hält Nachricht kompakt & HTML-Tags intakt
+    msg = build_telegram_message(deal, "T" * 400, "https://example.com/deal")
+    assert len(msg) < 4096
+    assert msg.count("<b>") == msg.count("</b>")
+    assert "…" in msg
+
+    # 2. 4x HTTP 429 wirft Exception (kein stiller Deal-Verlust!)
+    resp_429 = MagicMock()
+    resp_429.status_code = 429
+    resp_429.json.return_value = {"parameters": {"retry_after": 1}}
+    resp_429.raise_for_status.side_effect = requests.HTTPError("429 Too Many Requests")
+    sess_429 = MagicMock()
+    sess_429.post.return_value = resp_429
+
+    with patch("bot.interruptible_sleep", return_value=False):
+        try:
+            send_telegram(deal, "Test Deal", "https://example.com/deal", session=sess_429)
+            assert False, "Expected HTTPError after repeated 429"
+        except requests.HTTPError:
+            pass
+    assert sess_429.post.call_count == 4
+
+    # 3. Transientes HTTP 503 -> 200 wird sauber wiederholt
+    resp_503 = MagicMock()
+    resp_503.status_code = 503
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.raise_for_status.return_value = None
+    sess_503 = MagicMock()
+    sess_503.post.side_effect = [resp_503, resp_200]
+
+    with patch("bot.interruptible_sleep", return_value=False):
+        send_telegram(deal, "Test Deal", "https://example.com/deal", session=sess_503)
+    assert sess_503.post.call_count == 2
+
+    # 4. ReadTimeout (nicht idempotent) macht maximal 1 Retry und wirft dann
+    sess_timeout = MagicMock()
+    sess_timeout.post.side_effect = requests.exceptions.ReadTimeout("timed out")
+    with patch("bot.interruptible_sleep", return_value=False):
+        try:
+            send_telegram(deal, "Test Deal", "https://example.com/deal", session=sess_timeout)
+            assert False, "Expected ReadTimeout"
+        except requests.exceptions.ReadTimeout:
+            pass
+    assert sess_timeout.post.call_count == 2
+
+    # 5. Shutdown-Event bricht Retry sofort ab
+    stop_evt = threading.Event()
+    stop_evt.set()
+    sess_stop = MagicMock()
+    sess_stop.post.return_value = resp_503
+    try:
+        send_telegram(deal, "Test Deal", "https://example.com/deal", session=sess_stop, stop_event=stop_evt)
+        assert False, "Expected RuntimeError on shutdown"
+    except RuntimeError as exc:
+        assert "Shutdown" in str(exc)
+
+
+def test_origin_hijacking_word_boundaries_and_german_compounds():
+    base_deal = FlightDealEvaluation(
+        detected_cabin_class="Business Class",
+        cabin_class_quote="Air China Business Class nach Bangkok",
+        is_relevant=True,
+        deal_category="Star Alliance (Nur Points)",
+        airline_names="Air China (CA)",
+        primary_airline_iata="CA",
+        iata_origin="BER",
+        iata_destination="BKK",
+        is_open_jaw=False,
+        iata_return_end="BER",
+        region="Asien",
+        sample_outbound_date="2027-02-10",
+        sample_return_date="2027-02-24",
+        price_eur=1650,
+        booking_class="R",
+        mm_points=400,
+        mm_qualifying_points=0,
+        cabin_assessment="Lie-Flat",
+        routing_advice="",
+        rejection_reason="",
+    )
+
+    # BER darf NICHT durch 'über' / 'Oktober' / 'November' durchgewunken werden
+    ok_ber, reason_ber = validate_deal_safety(
+        base_deal,
+        "Business Class über Warschau im Oktober",
+        "Flüge ab Warschau (WAW) nach Bangkok im Oktober und November.",
+    )
+    assert ok_ber is False
+    assert "Origin-Hijacking" in reason_ber
+
+    # FRA darf NICHT durch 'Frage' oder 'Frankreich' durchgewunken werden
+    deal_fra = base_deal.model_copy(update={"iata_origin": "FRA", "iata_return_end": "FRA"})
+    ok_fra_false, _ = validate_deal_safety(
+        deal_fra,
+        "Frage zu Deal ab Frankreich",
+        "Flüge ab Paris (CDG) nach Bangkok.",
+    )
+    assert ok_fra_false is False
+
+    # FCO darf NICHT durch 'FROM' (wegen Alias 'ROM') durchgewunken werden
+    deal_fco = base_deal.model_copy(update={"iata_origin": "FCO", "iata_return_end": "FCO"})
+    ok_fco_false, _ = validate_deal_safety(
+        deal_fco,
+        "Business Class from Warsaw to Bangkok",
+        "Great promo flights from WAW to BKK.",
+    )
+    assert ok_fco_false is False
+
+    # Deutsche Komposita/Adjektive ('Frankfurter', 'Hamburger') bleiben erlaubt
+    ok_fra_compound, _ = validate_deal_safety(
+        deal_fra,
+        "Frankfurter Flughafen Business Class nach Bangkok",
+        "Abflug vom Frankfurter Flughafen nach Bangkok für 1.650 Euro.",
+    )
+    assert ok_fra_compound is True
+
+    deal_ham = base_deal.model_copy(update={"iata_origin": "HAM", "iata_return_end": "HAM"})
+    ok_ham_compound, _ = validate_deal_safety(
+        deal_ham,
+        "Hamburger Abflüge in Business Class nach Bangkok",
+        "Attraktive Business Class Tarife für Hamburger Reisende nach Bangkok.",
+    )
+    assert ok_ham_compound is True
+
+
+def test_gemini_model_cooldown_and_interruptible_shutdown():
+    cooldowns: dict[str, float] = {}
+    called_models: list[str] = []
+    mock_client = MagicMock()
+
+    def side_effect(model, contents, config):
+        called_models.append(model)
+        if model == "gemini-3.8-flash":
+            raise RuntimeError("404 NOT_FOUND: model not available")
+        resp = MagicMock()
+        resp.text = "ok"
+        return resp
+
+    mock_client.models.generate_content.side_effect = side_effect
+
+    # 1. Erster Aufruf: gemini-3.8-flash liefert 404 -> Cooldown gesetzt, Fallback auf gemini-flash-latest
+    r1 = generate_with_gemini_fallback(
+        client=mock_client,
+        prompt="Test 1",
+        preferred_model="gemini-3.8-flash",
+        model_cooldowns=cooldowns,
+    )
+    assert r1.text == "ok"
+    assert called_models == ["gemini-3.8-flash", "gemini-flash-latest"]
+    assert "gemini-3.8-flash" in cooldowns
+
+    # 2. Zweiter Aufruf: gemini-3.8-flash wird sofort übersprungen!
+    called_models.clear()
+    r2 = generate_with_gemini_fallback(
+        client=mock_client,
+        prompt="Test 2",
+        preferred_model="gemini-3.8-flash",
+        model_cooldowns=cooldowns,
+    )
+    assert r2.text == "ok"
+    assert called_models == ["gemini-flash-latest"]
+
+    # 3. clear_gemini_model_cooldowns leert den Cache sauber
+    clear_gemini_model_cooldowns(cooldowns)
+    assert cooldowns == {}
+
+    # 4. Shutdown bricht Backoff-Sleep sofort ab
+    stop_evt = threading.Event()
+    stop_evt.set()
+    mock_client_503 = MagicMock()
+    mock_client_503.models.generate_content.side_effect = RuntimeError("503 UNAVAILABLE")
+    try:
+        generate_with_gemini_fallback(
+            client=mock_client_503,
+            prompt="Test 3",
+            preferred_model="gemini-3.8-flash",
+            model_cooldowns={},
+            stop_event=stop_evt,
+        )
+        assert False, "Expected RuntimeError on shutdown"
+    except RuntimeError as exc:
+        assert "Shutdown" in str(exc)
+
+
+def test_enriched_deal_context_skips_unnecessary_scraping():
+    long_text = "Business Class Deal ab Frankfurt nach Bangkok. " * 45  # > 1800 Zeichen ohne OTA-Link
+    forum_text = "Vielfliegertreff Business Class Tarifdetails ab Amsterdam nach Tokio. " * 20  # > 1200 Zeichen
+    short_text = "Kurzer Teaser Business Class ab FRA."
+
+    with patch("bot.fetch_article_html", return_value="<html><body>Full page</body></html>") as mock_fetch:
+        text_long, _ = get_enriched_deal_context(long_text, "https://example.com/deal/long")
+        assert len(text_long) >= 1800
+        assert mock_fetch.call_count == 0
+
+        text_forum, _ = get_enriched_deal_context(
+            forum_text, "https://www.vielfliegertreff.de/forum/threads/test.12345/"
+        )
+        assert len(text_forum) >= 1200
+        assert mock_fetch.call_count == 0
+
+        get_enriched_deal_context(short_text, "https://example.com/deal/short")
+        assert mock_fetch.call_count == 1
+
+
+def test_fetch_all_feeds_etag_304_and_health_logging(caplog):
+    feed_url = "https://example.com/business-class/feed/"
+    rss_xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<rss version='2.0'><channel><title>Test</title>"
+        "<item><title>SWISS Business Class BKK</title><link>https://example.com/deal-1</link></item>"
+        "</channel></rss>"
+    )
+    resp_200 = MagicMock()
+    resp_200.status_code = 200
+    resp_200.text = rss_xml
+    resp_200.headers = {"ETag": '"etag-123"', "Last-Modified": "Fri, 27 Nov 2026 10:00:00 GMT"}
+
+    resp_304 = MagicMock()
+    resp_304.status_code = 304
+    resp_304.text = ""
+    resp_304.headers = {}
+
+    seen_headers: list[dict] = []
+
+    def fake_get(url, headers=None, timeout=15):
+        seen_headers.append(dict(headers or {}))
+        return resp_200 if len(seen_headers) == 1 else resp_304
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = fake_get
+    cache: dict[str, dict[str, str]] = {}
+
+    with caplog.at_level(logging.INFO):
+        res1 = fetch_all_feeds([feed_url], max_workers=1, session=mock_session, http_cache=cache)
+        assert len(res1) == 1 and len(res1[0][1]) == 1
+
+        caplog.clear()
+        res2 = fetch_all_feeds([feed_url], max_workers=1, session=mock_session, http_cache=cache)
+        assert res2 == []
+
+    assert seen_headers[1].get("If-None-Match") == '"etag-123"'
+    assert seen_headers[1].get("If-Modified-Since") == "Fri, 27 Nov 2026 10:00:00 GMT"
+    assert any("Feed-Scan erfolgreich: 1/1 Feeds aktiv" in r.message and "304" in r.message for r in caplog.records)
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+
+
+def test_main_cycle_error_recovers_with_backoff():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "deals.db")
+        hb_path = os.path.join(tmpdir, "heartbeat")
+        observed_waits: list[int] = []
+
+        def fake_wait(total_seconds, *args, **kwargs) -> bool:
+            observed_waits.append(total_seconds)
+            return True  # Nach dem ersten Backoff geordnet beenden
+
+        with (
+            patch("bot.DB_PATH", db_path),
+            patch("bot.HEARTBEAT_FILE", hb_path),
+            patch("bot.validate_startup"),
+            patch("bot.create_genai_client", return_value=MagicMock()),
+            patch("bot.fetch_all_feeds", side_effect=RuntimeError("Simulierter Netzwerk-Crash")),
+            patch("bot.wait_for_next_cycle", side_effect=fake_wait),
+            patch("bot.STOP_EVENT", threading.Event()),
+        ):
+            main()
+
+        assert observed_waits == [60]
+        assert not os.path.exists(f"{db_path}-wal")
+        assert not os.path.exists(f"{db_path}-shm")
