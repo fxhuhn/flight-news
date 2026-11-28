@@ -22,6 +22,7 @@ from bot import (
     build_gf_main_url,
     build_positioning_url,
     build_telegram_message,
+    build_telegram_reply_markup,
     checkpoint_db,
     clean_html,
     cleanup_db,
@@ -378,22 +379,23 @@ def test_telegram_formatting_and_redundancy_defense():
         }
     )
     msg_red = build_telegram_message(deal_redundant, "Prague -> Beijing", "https://example.com/deal")
-    assert "✈️ <b>Top-Bordprodukt</b>\n" in msg_red
+    assert "<i>Etihad Airways · Top-Bordprodukt</i>" in msg_red
     assert "Non-Alliance" not in msg_red
     assert "Oneworld" not in msg_red
     assert "SkyTeam" not in msg_red
-    assert "Besonderheiten:" not in msg_red
+    assert "ℹ️" not in msg_red
+    assert "🏆" not in msg_red
     assert "Etihad Airways ist nicht in einer Allianz" not in msg_red
 
     deal_empty = deal_base.model_copy(update={"routing_advice": ""})
     msg_empty = build_telegram_message(deal_empty, "Prague -> Beijing", "https://example.com/deal")
-    assert "Besonderheiten:" not in msg_empty
+    assert "ℹ️" not in msg_empty
 
     deal_features = deal_base.model_copy(
         update={"routing_advice": "Auch ab BUD und MXP buchbar. Stopover in AUH kostenlos."}
     )
     msg_feat = build_telegram_message(deal_features, "Prague -> Beijing", "https://example.com/deal")
-    assert "Stopover in AUH kostenlos" in msg_feat
+    assert "ℹ️ Auch ab BUD und MXP buchbar. Stopover in AUH kostenlos." in msg_feat
 
 
 def test_alliance_display_in_top_bordprodukt():
@@ -437,8 +439,11 @@ def test_alliance_display_in_top_bordprodukt():
         "Amsterdam → East & South East Asia Business Class Round Trip 1785€",
         "https://example.com/ams-asia",
     )
-    assert msg_ey.startswith("✈️ <b>Top-Bordprodukt</b>\n")
-    assert "(" not in msg_ey.splitlines()[0]
+    assert msg_ey.startswith("✈️ <b>AMS ➔ AUH ➔ BKK · ~1.785 €</b>\n")
+    assert "<i>Etihad Airways (EY) · Top-Bordprodukt</i>" in msg_ey
+    assert "<blockquote>Amsterdam → East &amp; South East Asia Business Class Round Trip 1785€</blockquote>" in msg_ey
+    assert "Oneworld" not in msg_ey
+    assert "SkyTeam" not in msg_ey
 
     msg_ey_drop = build_telegram_message(
         deal_ey_norm,
@@ -446,7 +451,8 @@ def test_alliance_display_in_top_bordprodukt():
         "https://example.com/ams-asia",
         prev_price=1950,
     )
-    assert msg_ey_drop.startswith("📉 <b>PREIS-UPDATE: Top-Bordprodukt</b>\n")
+    assert msg_ey_drop.startswith("📉 <b>AMS ➔ AUH ➔ BKK · ~1.785 €</b> <i>(-165 €)</i>\n")
+    assert "<i>Etihad Airways (EY) · Top-Bordprodukt</i>" in msg_ey_drop
 
     deal_cz = deal_ey.model_copy(
         update={
@@ -468,7 +474,7 @@ def test_alliance_display_in_top_bordprodukt():
     deal_qr_norm = normalize_and_verify_deal_mm_points(deal_qr)
     assert deal_qr_norm.deal_category == "Top-Bordprodukt (Oneworld)"
     msg_qr = build_telegram_message(deal_qr_norm, "Amsterdam → Bangkok", "https://example.com/qr")
-    assert msg_qr.startswith("✈️ <b>Top-Bordprodukt (Oneworld)</b>\n")
+    assert "<i>Qatar Airways (QR) · Top-Bordprodukt (Oneworld)</i>" in msg_qr
 
     # 3. SkyTeam-Airline (z.B. KLM KL, Vietnam Airlines VN) -> Top-Bordprodukt (SkyTeam)
     deal_kl = deal_ey.model_copy(
@@ -481,7 +487,7 @@ def test_alliance_display_in_top_bordprodukt():
     deal_kl_norm = normalize_and_verify_deal_mm_points(deal_kl)
     assert deal_kl_norm.deal_category == "Top-Bordprodukt (SkyTeam)"
     msg_kl = build_telegram_message(deal_kl_norm, "Amsterdam → Bangkok", "https://example.com/kl")
-    assert msg_kl.startswith("✈️ <b>Top-Bordprodukt (SkyTeam)</b>\n")
+    assert "<i>KLM (KL) · Top-Bordprodukt (SkyTeam)</i>" in msg_kl
 
 
 def test_required_intermediate_stops_in_telegram_message():
@@ -523,7 +529,9 @@ def test_required_intermediate_stops_in_telegram_message():
         "European Cities → Bangkok Business Class Round Trip from 1785€",
         "https://premium-flights.com/business-class-european-cities-to-bangkok/",
     )
-    assert "• <b>Route:</b> <code>AMS</code> ➔ <code>HEL</code> ➔ <code>BKK</code> (Finnair (AY))" in msg_ay
+    assert "✈️ <b>AMS ➔ HEL ➔ BKK · ~1.785 €</b>" in msg_ay
+    assert "<i>Finnair (AY) · Top-Bordprodukt (Oneworld)</i>" in msg_ay
+    assert "Nicht genannt" not in msg_ay
     assert "TLL" not in resolve_deal_stops(deal_finnair)
 
     # 3. Echter Nonstop-Flug ab Hub (z.B. HEL -> BKK mit Finnair) darf KEINEN doppelten Stopp zeigen
@@ -532,7 +540,7 @@ def test_required_intermediate_stops_in_telegram_message():
     )
     assert resolve_deal_stops(deal_ay_nonstop) == []
     msg_ay_nonstop = build_telegram_message(deal_ay_nonstop, "Helsinki -> Bangkok", "https://example.com/ay")
-    assert "• <b>Route:</b> <code>HEL</code> ➔ <code>BKK</code> (Finnair (AY))" in msg_ay_nonstop
+    assert "✈️ <b>HEL ➔ BKK · ~1.785 €</b>" in msg_ay_nonstop
 
     # 4. Sanitizer für unsaubere Modell-Outputs (Klammernotation, Origin/Dest-Wiederholung, Direktflug-Marker)
     assert normalize_iata_via(["Helsinki (HEL)"], "AMS", "BKK") == ["HEL"]
@@ -543,10 +551,7 @@ def test_required_intermediate_stops_in_telegram_message():
     # 5. Mehrere Stopps & Open-Jaw (inkl. Gabelflug zurück zum Hub wie AMS -> HEL -> BKK -> HEL)
     deal_multi_oj = deal_finnair.model_copy(update={"iata_via": ["HEL"], "is_open_jaw": True, "iata_return_end": "HEL"})
     msg_oj = build_telegram_message(deal_multi_oj, "Open Jaw Deal", "https://example.com/oj")
-    assert (
-        "• <b>Route:</b> <code>AMS</code> ➔ <code>HEL</code> ➔ <code>BKK</code> ➔ <code>HEL</code> (Gabelflug) (Finnair (AY))"
-        in msg_oj
-    )
+    assert "✈️ <b>AMS ➔ HEL ➔ BKK ➔ HEL (Gabelflug) · ~1.785 €</b>" in msg_oj
 
     # 6. Multi-Hub-Airline (Lufthansa): Nonstop ab FRA bleibt ohne Stopp, ab HAM Fallback auf FRA/MUC bzw. expliziter Hub
     deal_lh_fra = deal_finnair.model_copy(
@@ -1026,8 +1031,13 @@ def test_google_flights_live_check_and_positioning_price():
     assert len(seen_queries) == 3
 
     msg_ok = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live)
-    assert "• <b>Google Flights Live-Check:</b> ✅ ab ~1448 € bestätigt (29.12.–12.01.)" in msg_ok
-    assert "Positionierung: HAM–CDG (+/- 24h Stopover, ab ~138 €)" in msg_ok
+    assert "✅ Live-Check: ~1.448 € (29.12.–12.01.)" in msg_ok
+    assert "💶 ~1.430 € + ~138 € ab HAM ≈ <b>1.568 € gesamt</b>" in msg_ok
+    markup_ok = build_telegram_reply_markup(deal, "https://example.com/deal", live_check=live)
+    btn_texts = [btn["text"] for row in markup_ok["inline_keyboard"] for btn in row]
+    assert "🔎 Google Flights" in btn_texts
+    assert "📰 Quelle" in btn_texts
+    assert "🛫 HAM–CDG (~138 €)" in btn_texts
 
     # 2. Warn-Badge wenn Live-Preis deutlich über Deal-Preis liegt
     live_warn = GoogleFlightsLiveCheckResult(
@@ -1039,8 +1049,10 @@ def test_google_flights_live_check_and_positioning_price():
         positioning_price_eur=None,
     )
     msg_warn = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live_warn)
-    assert "⚠️ am Beispieltermin ab ~2180 €" in msg_warn
-    assert "Positionierung: HAM–CDG (+/- 24h Stopover)" in msg_warn
+    assert "⚠️ Live-Check: ~2.180 € (15.12.–29.12., andere Daten/OTA prüfen)" in msg_warn
+    markup_warn = build_telegram_reply_markup(deal, "https://example.com/deal", live_check=live_warn)
+    warn_btn_texts = [btn["text"] for row in markup_warn["inline_keyboard"] for btn in row]
+    assert "🛫 HAM–CDG" in warn_btn_texts
 
     # 3. Fail-Open bei Google-Blockade / Exception -> kein Crash, keine Live-Check-Zeile
     def failing_fetcher(_q):
@@ -1052,7 +1064,7 @@ def test_google_flights_live_check_and_positioning_price():
     assert live_fail.main_price_eur is None
     assert live_fail.positioning_price_eur is None
     msg_fail = build_telegram_message(deal, "Paris -> Colombo", "https://example.com/deal", live_check=live_fail)
-    assert "Google Flights Live-Check" not in msg_fail
+    assert "Live-Check" not in msg_fail
 
     # 4. Bei bevorzugtem Hub (FRA) wird kein Positionierungsflug abgefragt
     deal_fra = deal.model_copy(update={"iata_origin": "FRA", "iata_return_end": "FRA"})
@@ -1146,15 +1158,15 @@ def test_additional_and_priority_destinations():
     assert "MNL, KUL" in captured_prompts[0]
     assert "additional_destinations" in captured_prompts[0]
     assert evaluated.additional_destinations == ["BKK (~1.785 €)", "SIN (~1.850 €)"]
-    assert "✈️ <b>Top-Bordprodukt ⭐</b>" in msg_priority
-    assert "• <b>Weitere Ziele im Sale:</b> BKK (~1.785 €), SIN (~1.850 €)" in msg_priority
+    assert "✈️ <b>AMS ➔ CAN ➔ KUL · ~1.820 €</b> ⭐" in msg_priority
+    assert "🌍 Auch im Sale: BKK (~1.785 €), SIN (~1.850 €)" in msg_priority
 
-    # 3. Normaler Einzelziel-Deal ohne Wunschziel hat weder ⭐ noch 'Weitere Ziele im Sale'
+    # 3. Normaler Einzelziel-Deal ohne Wunschziel hat weder ⭐ noch 'Auch im Sale'
     deal_bkk = deal_kul.model_copy(update={"iata_destination": "BKK", "additional_destinations": []})
     with patch.dict(CONFIG["destinations"], {"priority_destinations": ["MNL", "KUL"]}):
         msg_normal = build_telegram_message(deal_bkk, "China Southern AMS -> BKK", "https://example.com/cz-bkk")
     assert "⭐" not in msg_normal
-    assert "Weitere Ziele im Sale" not in msg_normal
+    assert "Auch im Sale" not in msg_normal
 
 
 def test_deterministic_airbag_regions_origins_and_prices():
@@ -1530,6 +1542,9 @@ def test_send_telegram_retries_and_no_silent_drop():
     with patch("bot.interruptible_sleep", return_value=False):
         send_telegram(deal, "Test Deal", "https://example.com/deal", session=sess_503)
     assert sess_503.post.call_count == 2
+    sent_payload = sess_503.post.call_args.kwargs["json"]
+    assert "reply_markup" in sent_payload
+    assert len(sent_payload["reply_markup"]["inline_keyboard"][0]) == 2
 
     # 4. ReadTimeout (nicht idempotent) macht maximal 1 Retry und wirft dann
     sess_timeout = MagicMock()

@@ -2828,6 +2828,47 @@ def _truncate_text(text: str, max_len: int) -> str:
     return cleaned[: max(1, max_len - 1)].rstrip() + "…"
 
 
+def _format_eur(amount: int) -> str:
+    """Formatiert Euro-Beträge mit deutschem Tausenderpunkt (z.B. 1785 -> '1.785')."""
+    return f"{int(amount):,}".replace(",", ".")
+
+
+def build_telegram_reply_markup(
+    deal: FlightDealEvaluation,
+    url: str,
+    sample_booking: str = "",
+    live_check: GoogleFlightsLiveCheckResult | None = None,
+) -> dict[str, Any]:
+    """Erstellt kompakte, daumenfreundliche Telegram Inline-URL-Buttons für den Deal."""
+    origin_code = normalize_airport_iata(deal.iata_origin)
+    preferred_hubs = get_preferred_hubs()
+    gf_main = build_gf_main_url(deal)
+
+    row1: list[dict[str, str]] = [
+        {"text": "🔎 Google Flights", "url": gf_main},
+    ]
+    if url and url.startswith("http"):
+        row1.append({"text": "📰 Quelle", "url": url})
+
+    row2: list[dict[str, str]] = []
+    if origin_code and origin_code not in preferred_hubs:
+        gf_pos = build_positioning_url(
+            origin_code, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
+        )
+        pos_price = (
+            f" (~{_format_eur(live_check.positioning_price_eur)} €)"
+            if (live_check and live_check.positioning_price_eur is not None)
+            else ""
+        )
+        row2.append({"text": f"🛫 {HOME_AIRPORT}–{origin_code}{pos_price}", "url": gf_pos})
+
+    if sample_booking and sample_booking.startswith("http"):
+        row2.append({"text": "🎫 OTA", "url": sample_booking})
+
+    keyboard = [row for row in (row1, row2) if row]
+    return {"inline_keyboard": keyboard}
+
+
 def build_telegram_message(
     deal: FlightDealEvaluation,
     title: str,
@@ -2839,55 +2880,87 @@ def build_telegram_message(
     origin_code = normalize_airport_iata(deal.iata_origin)
     dest_code = normalize_airport_iata(deal.iata_destination)
     preferred_hubs = get_preferred_hubs()
-    gf_main = build_gf_main_url(deal)
-    pos_line = ""
-    if origin_code not in preferred_hubs:
-        gf_pos = build_positioning_url(
-            origin_code, deal.sample_outbound_date, deal.sample_return_date, home=HOME_AIRPORT
-        )
-        pos_price_suffix = (
-            f", ab ~{live_check.positioning_price_eur} €"
-            if (live_check and live_check.positioning_price_eur is not None)
-            else ""
-        )
-        pos_line = f'\n🔹 <a href="{gf_pos}">Positionierung: {html.escape(HOME_AIRPORT)}–{html.escape(origin_code)} (+/- 24h Stopover{pos_price_suffix})</a>'
-
-    booking_line = ""
-    if sample_booking and sample_booking.startswith("http"):
-        booking_line = f'\n🔹 <a href="{html.escape(sample_booking, quote=True)}">Geprüftes Buchungsbeispiel (Skyscanner / OTA)</a>'
 
     stops = resolve_deal_stops(deal)
     route_nodes = [origin_code, *stops, dest_code]
-    route_str = " ➔ ".join(f"<code>{html.escape(node)}</code>" for node in route_nodes if node)
+    route_str = " ➔ ".join(html.escape(node) for node in route_nodes if node)
     if deal.is_open_jaw and deal.iata_return_end and deal.iata_return_end != deal.iata_origin:
-        route_str += f" ➔ <code>{html.escape(normalize_airport_iata(deal.iata_return_end))}</code> (Gabelflug)"
+        route_str += f" ➔ {html.escape(normalize_airport_iata(deal.iata_return_end))} (Gabelflug)"
 
-    ftl_info = ""
-    if deal.mm_points > 0:
+    priority_dest_set = {
+        str(d).strip().upper()
+        for d in CONFIG.get("destinations", {}).get("priority_destinations", [])
+        if str(d).strip()
+    }
+    priority_suffix = " ⭐" if dest_code in priority_dest_set else ""
+    price_str = f"~{_format_eur(deal.price_eur)} €"
+
+    # Zeile 1: Lockscreen-optimierter Header aus einem Guss (ohne <code>-Sprung)
+    if prev_price > 0 and prev_price > deal.price_eur:
+        diff = prev_price - deal.price_eur
+        header_line = f"📉 <b>{route_str} · {price_str}</b> <i>(-{_format_eur(diff)} €)</i>{priority_suffix}"
+    else:
+        header_line = f"✈️ <b>{route_str} · {price_str}</b>{priority_suffix}"
+
+    # Zeile 2: Subheader mit Airline & Kategorie
+    category_label = resolve_deal_category(deal)
+    safe_airline_names = html.escape(_truncate_text(deal.airline_names, 120))
+    subheader_line = f"<i>{safe_airline_names} · {html.escape(category_label)}</i>"
+
+    safe_title_quote = f"<blockquote>{html.escape(_truncate_text(title, 240))}</blockquote>"
+
+    # Detail-Block mit eindeutigen Emoji-Ankern (ohne Null-Zeilen / 'Nicht genannt'-Rauschen)
+    detail_lines: list[str] = []
+
+    raw_cabin = (deal.cabin_assessment or "").strip()
+    has_cabin = bool(raw_cabin) and raw_cabin.lower() != "nicht genannt"
+    raw_booking_class = (deal.booking_class or "").strip()
+    has_booking_class = bool(raw_booking_class) and raw_booking_class.lower() != "nicht genannt"
+    cabin_parts: list[str] = []
+    if has_cabin:
+        cabin_parts.append(html.escape(_truncate_text(raw_cabin, 160)))
+    elif deal.detected_cabin_class == "First Class":
+        cabin_parts.append("First Class")
+    if has_booking_class:
+        cabin_parts.append(f"Klasse <code>{html.escape(raw_booking_class)}</code>")
+    if cabin_parts:
+        detail_lines.append(f"💺 {' · '.join(cabin_parts)}")
+
+    if deal.mm_points > 0 or deal.mm_qualifying_points > 0:
         pct_p = round((deal.mm_points / 650) * 100)
         pct_qp = round((deal.mm_qualifying_points / 325) * 100)
-        ftl_info = f" (FTL-Ziel: ~{pct_p}% Points / ~{pct_qp}% QP)"
+        detail_lines.append(
+            f"🏆 <b>{deal.mm_points} Points · {deal.mm_qualifying_points} QP</b> <i>({pct_p}% / {pct_qp}% FTL)</i>"
+        )
 
-    airline_label = f" ({html.escape(deal.primary_airline_iata)})" if deal.primary_airline_iata else ""
+    if (
+        origin_code
+        and origin_code not in preferred_hubs
+        and live_check
+        and live_check.positioning_price_eur is not None
+    ):
+        total_eur = deal.price_eur + live_check.positioning_price_eur
+        detail_lines.append(
+            f"💶 ~{_format_eur(deal.price_eur)} € + ~{_format_eur(live_check.positioning_price_eur)} € "
+            f"ab {html.escape(HOME_AIRPORT)} ≈ <b>{_format_eur(total_eur)} € gesamt</b>"
+        )
 
-    live_check_line = ""
     if live_check and live_check.main_price_eur is not None:
         date_range = _format_short_date_range(
             live_check.main_outbound_date or deal.sample_outbound_date,
             live_check.main_return_date or deal.sample_return_date,
         )
+        live_price_str = f"~{_format_eur(live_check.main_price_eur)} €"
         if live_check.price_matches_deal:
-            live_check_line = (
-                f"• <b>Google Flights Live-Check:</b> ✅ ab ~{live_check.main_price_eur} € bestätigt ({date_range})\n"
-            )
+            detail_lines.append(f"✅ Live-Check: {live_price_str} ({date_range})")
         else:
-            live_check_line = (
-                f"• <b>Google Flights Live-Check:</b> ⚠️ am Beispieltermin ab ~{live_check.main_price_eur} € "
-                f"({date_range} – andere Daten/OTA prüfen)\n"
-            )
+            detail_lines.append(f"⚠️ Live-Check: {live_price_str} ({date_range}, andere Daten/OTA prüfen)")
 
-    # Besonderheiten (routing_advice) konditional & mit Sicherheitsfilter (Meilen, Allianzen & generische Boilerplate) einbinden
-    advice_line = ""
+    extra_dests = normalize_additional_destinations(deal.additional_destinations, dest_code)
+    if extra_dests:
+        formatted_dests = ", ".join(html.escape(_truncate_text(d, 40)) for d in extra_dests)
+        detail_lines.append(f"🌍 Auch im Sale: {formatted_dests}")
+
     raw_advice = (deal.routing_advice or "").strip()
     forbidden_advice_keywords = [
         "point",
@@ -2906,54 +2979,12 @@ def build_telegram_message(
         "skyscanner",
     ]
     if raw_advice and not any(kw in raw_advice.lower() for kw in forbidden_advice_keywords):
-        advice_line = f"• <b>Besonderheiten:</b> {html.escape(_truncate_text(raw_advice, 400))}\n"
+        detail_lines.append(f"ℹ️ {html.escape(_truncate_text(raw_advice, 400))}")
 
-    # Header & Preisangabe (bei Preissenkungen & Wunschzielen hervorheben)
-    priority_dest_set = {
-        str(d).strip().upper()
-        for d in CONFIG.get("destinations", {}).get("priority_destinations", [])
-        if str(d).strip()
-    }
-    priority_suffix = " ⭐" if dest_code in priority_dest_set else ""
-    category_label = resolve_deal_category(deal)
-    if prev_price > 0 and prev_price > deal.price_eur:
-        header_line = f"📉 <b>PREIS-UPDATE: {html.escape(category_label)}{priority_suffix}</b>"
-        diff = prev_price - deal.price_eur
-        price_line = f"• <b>Preis:</b> ~{deal.price_eur} € 📉 <i>(-{diff} € gegenüber bisher ~{prev_price} €!)</i> (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
-    else:
-        header_line = f"✈️ <b>{html.escape(category_label)}{priority_suffix}</b>"
-        price_line = (
-            f"• <b>Preis:</b> ~{deal.price_eur} € (Buchungsklasse: <code>{html.escape(deal.booking_class)}</code>)"
-        )
-
-    extra_dests = normalize_additional_destinations(deal.additional_destinations, dest_code)
-    extra_dests_line = ""
-    if extra_dests:
-        formatted_dests = ", ".join(html.escape(_truncate_text(d, 40)) for d in extra_dests)
-        extra_dests_line = f"• <b>Weitere Ziele im Sale:</b> {formatted_dests}\n"
-
-    cabin_link_label = "First" if deal.detected_cabin_class == "First Class" else "Business"
-    safe_title = html.escape(_truncate_text(title, 240))
-    safe_airline_names = html.escape(_truncate_text(deal.airline_names, 120))
-    safe_cabin_assessment = html.escape(_truncate_text(deal.cabin_assessment, 160))
-
-    msg = (
-        f"{header_line}\n\n"
-        f"<b>{safe_title}</b>\n\n"
-        f"• <b>Route:</b> {route_str} ({safe_airline_names})\n"
-        f"{extra_dests_line}"
-        f"{price_line}\n"
-        f"{live_check_line}"
-        f"• <b>Miles & More:</b> {deal.mm_points} Points | <b>{deal.mm_qualifying_points} QP</b>{ftl_info}\n"
-        f"• <b>Bordprodukt:</b> {safe_cabin_assessment}\n"
-        f"{advice_line}\n"
-        f"🔗 <b>Direktlinks:</b>\n"
-        f'🔹 <a href="{html.escape(url, quote=True)}">Deal-Quelle & Tarifdetails</a>\n'
-        f'🔹 <a href="{gf_main}">Google Flights: {html.escape(origin_code)}–{html.escape(dest_code)}{airline_label} ({cabin_link_label})</a>'
-        f"{pos_line}"
-        f"{booking_line}"
-    )
-    return msg
+    blocks = [f"{header_line}\n{subheader_line}", safe_title_quote]
+    if detail_lines:
+        blocks.append("\n".join(detail_lines))
+    return "\n\n".join(blocks)
 
 
 def send_telegram(
@@ -2967,17 +2998,26 @@ def send_telegram(
     stop_event: threading.Event | None = None,
 ) -> None:
     msg = build_telegram_message(deal, title, url, sample_booking, prev_price=prev_price, live_check=live_check)
+    reply_markup = build_telegram_reply_markup(deal, url, sample_booking=sample_booking, live_check=live_check)
     tg_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     s = session or SESSION
     max_attempts = 4
     backoff_delays = (2, 5, 10)
     non_idempotent_retries = 0
+    payload: dict[str, Any] = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": msg,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup.get("inline_keyboard"):
+        payload["reply_markup"] = reply_markup
 
     for attempt in range(max_attempts):
         try:
             resp = s.post(
                 tg_url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML", "disable_web_page_preview": True},
+                json=payload,
                 timeout=15,
             )
         except (requests.exceptions.ConnectTimeout, requests.exceptions.ConnectionError) as exc:
