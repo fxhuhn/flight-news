@@ -33,6 +33,7 @@ from bot import (
     evaluate_with_gemini,
     extract_entry_published_utc,
     extract_gf_lowest_price_from_html,
+    extract_source_domain,
     fetch_all_feeds,
     format_deal_route_plain,
     generate_with_gemini_fallback,
@@ -86,7 +87,7 @@ def test_database_and_deduplication():
         # 1. Schema-Prüfung
         c.execute("PRAGMA table_info(sent_deals)")
         cols = {col[1] for col in c.fetchall()}
-        assert {"price_eur", "airline_code", "updated_at", "deal_fingerprint"}.issubset(cols)
+        assert {"price_eur", "airline_code", "updated_at", "deal_fingerprint", "source_domain"}.issubset(cols)
 
         # 2. Test Stufe 1: seen_urls
         test_url = "https://travel-dealz.de/deal/biz-bangkok/"
@@ -1782,3 +1783,89 @@ def test_main_cycle_error_recovers_with_backoff():
         assert observed_waits == [60]
         assert not os.path.exists(f"{db_path}-wal")
         assert not os.path.exists(f"{db_path}-shm")
+
+
+def test_sent_deals_source_domain_migration_and_null_backwards_compat():
+    assert extract_source_domain("https://www.travel-dealz.de/deal/test/") == "travel-dealz.de"
+    assert extract_source_domain("https://loyaltylobby.com/2026/11/28/test/") == "loyaltylobby.com"
+    assert extract_source_domain("") == ""
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_path = os.path.join(tmpdir, "legacy_deals.db")
+
+        # 1. Simuliere Alt-Datenbank ohne source_domain-Spalte
+        legacy_conn = sqlite3.connect(db_path)
+        legacy_conn.execute(
+            """
+            CREATE TABLE sent_deals (
+                deal_fingerprint TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                price_eur INTEGER DEFAULT 0,
+                airline_code TEXT DEFAULT '',
+                updated_at TIMESTAMP
+            )
+            """
+        )
+        legacy_conn.execute(
+            """
+            INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, updated_at)
+            VALUES ('AMS-BKK-EY', 1750, 'EY', CURRENT_TIMESTAMP)
+            """
+        )
+        legacy_conn.commit()
+        legacy_conn.close()
+
+        # 2. init_db() migriert source_domain abwärtskompatibel per ALTER TABLE
+        conn = init_db(db_path)
+        try:
+            cols = {col[1] for col in conn.execute("PRAGMA table_info(sent_deals)").fetchall()}
+            assert "source_domain" in cols
+
+            # Expliziten NULL-Wert in Bestandszeile setzen und testen
+            conn.execute("UPDATE sent_deals SET source_domain = NULL WHERE deal_fingerprint = 'AMS-BKK-EY'")
+            conn.commit()
+
+            deal_ey = FlightDealEvaluation(
+                detected_cabin_class="Business Class",
+                cabin_class_quote="Etihad Business Class ab Amsterdam nach Bangkok",
+                is_relevant=True,
+                deal_category="Top-Bordprodukt",
+                airline_names="Etihad Airways (EY)",
+                primary_airline_iata="EY",
+                iata_origin="AMS",
+                iata_destination="BKK",
+                is_open_jaw=False,
+                iata_return_end="AMS",
+                region="Asien",
+                sample_outbound_date="2026-12-10",
+                sample_return_date="2026-12-20",
+                price_eur=1600,
+                booking_class="Z",
+                cabin_assessment="Lie-Flat",
+                mm_points=0,
+                mm_qualifying_points=0,
+                routing_advice="",
+                rejection_reason="",
+            )
+
+            # Preissturz gegen NULL-Bestandszeile muss sauber erkannt werden
+            send_drop, reason_drop, prev = should_send_deal(conn, deal_ey, min_price_drop=75)
+            assert send_drop is True
+            assert reason_drop == "price_drop"
+            assert prev == 1750
+
+            # Speichern mit source_url füllt source_domain
+            record_sent_deal(conn, deal_ey, source_url="https://www.insideflyer.nl/deal/ams-bkk/")
+            row = conn.execute(
+                "SELECT price_eur, source_domain FROM sent_deals WHERE deal_fingerprint = 'AMS-BKK-EY'"
+            ).fetchone()
+            assert row == (1600, "insideflyer.nl")
+
+            # Erneutes Update ohne source_url darf bestehendes source_domain nicht überschreiben
+            record_sent_deal(conn, deal_ey.model_copy(update={"price_eur": 1520}))
+            row2 = conn.execute(
+                "SELECT price_eur, source_domain FROM sent_deals WHERE deal_fingerprint = 'AMS-BKK-EY'"
+            ).fetchone()
+            assert row2 == (1520, "insideflyer.nl")
+        finally:
+            close_db(conn)

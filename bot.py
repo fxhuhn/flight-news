@@ -316,7 +316,7 @@ RSS_FEEDS = [
     # 2. Spezialisierte Business-Class & Status-Portale
     "https://premium-flights.com/feed/",  # Premium-Flights: Biz/First & Status-Runs
     "https://travel-dealz.de/kategorie/fluege/business-class/feed/",  # Travel-Dealz: Business Class
-    "https://travel-dealz.com/category/flights/business-class/feed/",  # Travel-Dealz COM: Ex-EU Deals
+    "https://travel-dealz.com/category/flights/business-class/feed/",  # Travel-Dealz COM: Ex-EU Business Class
     "https://travel-dealz.de/kategorie/fluege/first-class/feed/",  # Travel-Dealz: First Class
     "https://youhavebeenupgraded.boardingarea.com/feed/",  # You Have Been Upgraded: GDS/Matrix- & Biz-Deals
     # 3. DACH-Meilenblogs, internationale Deal-Portale & Error-Fare-Tracker
@@ -325,7 +325,9 @@ RSS_FEEDS = [
     "https://www.fly4free.com/flights/flight-deals/europe/feed/",  # Fly4Free: Europa-weite Deals & Error Fares
     "https://meilenoptimieren.com/feed/",  # meilenoptimieren: Deals & Punkte-Analysen
     "https://www.secretflying.com/category/flight-deals/europe-deals/feed/",  # Secret Flying: Europe Deals & Error Fares
-    "https://www.flynous.com/feed/",  # Flynous: Günstige Langstreckenflüge (inkl. Biz) ab Europa
+    "https://loyaltylobby.com/feed/",  # LoyaltyLobby: Ex-EU Business-Class-Sales & Vielflieger-Deals
+    "https://insideflyer.nl/feed/",  # InsideFlyer NL: Deals & News ab AMS / Benelux
+    "https://insideflyer.dk/feed/",  # InsideFlyer DK: Deals & News ab CPH / Skandinavien
 ]
 
 # Dedizierte Premium-Feeds (enthalten praktisch ausschließlich Business- / First-Class Angebote)
@@ -1709,6 +1711,8 @@ def init_db(db_path: str = DB_PATH) -> sqlite3.Connection:
             c.execute("ALTER TABLE sent_deals ADD COLUMN airline_code TEXT DEFAULT ''")
         if "updated_at" not in existing_cols:
             c.execute("ALTER TABLE sent_deals ADD COLUMN updated_at TIMESTAMP")
+        if "source_domain" not in existing_cols:
+            c.execute("ALTER TABLE sent_deals ADD COLUMN source_domain TEXT DEFAULT ''")
 
     conn.commit()
     return conn
@@ -1819,21 +1823,33 @@ def should_send_deal(
     return False, "duplicate", prev_price
 
 
-def record_sent_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation):
-    """Speichert oder aktualisiert den gesendeten Deal mit aktuellem Preis und Zeitstempel."""
+def extract_source_domain(url: str) -> str:
+    """Extrahiert die normalisierte Quell-Domain (ohne www.) aus einer Artikel- oder Feed-URL."""
+    if not url or not url.strip():
+        return ""
+    netloc = urllib.parse.urlsplit(url.strip()).netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return netloc
+
+
+def record_sent_deal(conn: sqlite3.Connection, deal: FlightDealEvaluation, source_url: str = ""):
+    """Speichert oder aktualisiert den gesendeten Deal mit aktuellem Preis, Quell-Domain und Zeitstempel."""
     fp = build_deal_fingerprint(deal)
     airline_code = (deal.primary_airline_iata or "").strip().upper()
+    source_domain = extract_source_domain(source_url)
     with closing(conn.cursor()) as c:
         c.execute(
             """
-            INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, updated_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO sent_deals (deal_fingerprint, price_eur, airline_code, source_domain, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(deal_fingerprint) DO UPDATE SET
                 price_eur = excluded.price_eur,
                 airline_code = excluded.airline_code,
+                source_domain = COALESCE(NULLIF(excluded.source_domain, ''), sent_deals.source_domain),
                 updated_at = CURRENT_TIMESTAMP
         """,
-            (fp, deal.price_eur, airline_code),
+            (fp, deal.price_eur, airline_code, source_domain),
         )
     conn.commit()
 
@@ -3499,7 +3515,7 @@ def main():
                                 prev_price=prev_price,
                                 live_check=live_check,
                             )
-                            record_sent_deal(conn, deal)
+                            record_sent_deal(conn, deal, source_url=raw_link)
                             cycle_pushed += 1
                             if send_reason == "price_drop":
                                 logging.info(
